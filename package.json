@@ -1,0 +1,27 @@
+{
+  "name": "deepchatcode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Poor Man's DeepSeek API — a local, OpenAI-compatible bridge that runs Codewhale through the free DeepSeek Chat web UI instead of a paid API key.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codewhale-hq/CodeWhale"
+  },
+  "keywords": [
+    "codewhale",
+    "deepseek",
+    "playwright",
+    "openai-compatible",
+    "relay"
+  ],
+  "comment": "This repository is a Rust crate; these scripts just delegate to cargo so the usual npm idioms work.",
+  "scripts": {
+    "build": "cargo build --release",
+    "test": "cargo test --locked",
+    "test:live": "cargo test --locked -- --ignored --nocapture",
+    "lint": "cargo clippy --locked --all-targets",
+    "fmt": "cargo fmt --check",
+    "fmt:fix": "cargo fmt"
+  }
+}

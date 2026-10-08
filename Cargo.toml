@@ -1,0 +1,49 @@
+[package]
+name = "deepchatcode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Poor Man's DeepSeek API — run Codewhale through the free DeepSeek Chat web UI, with no API key"
+repository = "https://github.com/codewhale-hq/CodeWhale"
+# So bare `cargo run` launches the bridge rather than asking which binary.
+default-run = "deepchatcode"
+
+[[bin]]
+name = "deepchatcode"
+path = "src/main.rs"
+
+[[bin]]
+name = "install-deepseek-browser"
+path = "src/install_browser.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+axum = { version = "0.8.5", features = ["json", "ws"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
+crossterm = "0.29.0"
+dirs = "7.0.0"
+futures-util = "0.3"
+libc = "0.2"
+playwright-rs = "0.19.0"
+ratatui = "0.30.2"
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "socks"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tempfile = "3.27"
+tokio = { version = "1.50.0", features = ["fs", "io-util", "io-std", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+url = "2.5"
+uuid = { version = "1.11", features = ["v4"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 16

@@ -1,0 +1,17 @@
+# Build output
+/target/
+
+# Local session-link database (per-machine state)
+*.db
+*.db-shm
+*.db-wal
+
+# Per-machine user config. The committed defaults live in
+# assets/config.default.toml and are embedded into the binary.
+/config.toml
+
+# Codewhale runtime state: pasted content, subagent transcripts, work graph.
+# Per-machine and potentially personal; never committed.
+/.codewhale/state/
+/.codewhale/pastes/
+/.codewhale/workflow-runs.jsonl

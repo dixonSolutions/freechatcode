@@ -1,0 +1,95 @@
+# Example user config for DeepChatCode.
+#
+# Copy to ~/.codewhale/deepchatcode/config.toml (or $CODEWHALE_HOME/deepchatcode/
+# config.toml) and edit. Every key is optional: anything you leave out keeps the
+# compiled-in default from assets/config.default.toml.
+#
+# Resolution order for any value: CLI flag > environment > this file > default.
+
+# Path to the codewhale executable. This is the value you asked about: it is
+# machine-specific, so it lives here rather than in the committed defaults.
+# Same as `--codewhale-bin` / `$CODEWHALE_BINARY`, which take precedence.
+[codewhale]
+binary = "/home/you/.cargo/bin/codewhale"
+# Instruction text handed to the chat model. Point it at an .md/.txt file; the
+# `{project_dir}` placeholder is filled from the working directory and
+# `{payload}` marks where the Codewhale request JSON goes. When unset, the
+# committed assets/system-prompt.md embedded in the binary is used.
+# system_prompt = "/home/you/.config/deepchatcode/system-prompt.md"
+
+# Browser settings. All of these are machine-specific.
+[browser]
+# "managed" launches a dedicated persistent profile; "attach" connects to an
+# already-running Chromium over CDP so your own signed-in session is reused.
+# mode = "attach"
+# Run Chromium headless. When sign-in is needed the wrapper reopens a visible
+# window automatically. Set false to always show the browser.
+# headless = true
+# Keep the browser running between turns. Set false to close it after every
+# reply (frees memory; the next turn relaunches or re-attaches).
+# keep_alive = true
+# How often to check that the browser is still there while idle, and reopen it
+# on the conversation in progress if it is not. 0 disables the check.
+# liveness_check_secs = 15
+# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# cdp_endpoint = "http://127.0.0.1:9222"
+
+# How completions are delivered.
+[transport]
+# "gui" drives the chat page (default). "api" POSTs to the site's own endpoint
+# from inside the page, reusing the browser session cookies — a private
+# endpoint, best-effort, fully configurable below.
+# mode = "api"
+
+#[transport.api]
+# url = "/api/v0/chat/completion"
+# framing = "sse"            # sse | json | text
+# text_path = "content"      # dot path into each response object
+# timeout_secs = 300
+# body = "{\"messages\":{messages},\"stream\":true}"
+
+# Override the chat address or accepted hosts.
+[chat]
+# url = "https://chat.deepseek.com"
+# allowed_hosts = ["chat.deepseek.com"]
+# routed_url_pattern = "/a/chat/s/"
+
+# Patch a selector when the DeepSeek Chat UI changes — no rebuild needed.
+[selectors]
+# composer = "textarea"
+# assistant = ".ds-markdown"
+# send = "button[type='submit']"
+# new_chat = "button[aria-label*='new chat' i]"
+# search_toggle = "button[aria-label*='search' i]"
+# thinking_toggle = "button[aria-label*='think' i]"
+# file_upload = "input[type='file']"
+# Element naming the model in use, so `deepchatcode turns` can attribute a
+# reply to a model. Empty (the default) records it as unknown.
+# model_label = "[data-testid*='model' i]"
+
+# Tool forwarding. By default Codewhale's full catalog is forwarded to the
+# chat. Set forward_all = false to send only the essentials plus the search
+# tool. Names live here, not in code — this is only an illustrative example.
+[tools]
+# forward_all = false
+# essential = ["read", "edit", "write", "bash"]
+# search = ["tool_search"]
+# allow_extra = ["some-mcp-tool"]
+
+[relay]
+# Show a desktop toast when the wrapper has to realign the browser.
+# desktop_notifications = true
+# Forward Codewhale's own system message (the project briefing) into the chat.
+# Off by default: the instruction file identifies the session instead, which
+# keeps the prompt small.
+# forward_system_prompt = true   # default: Codewhale's project briefing reaches the model
+
+[timeouts]
+# login_wait_secs = 900
+# login_probe_secs = 20
+# response_secs = 300
+# poll_ms = 150
+# settle_polls = 3
+# action_secs = 20
+# navigation_secs = 20
+# link_probe_secs = 10

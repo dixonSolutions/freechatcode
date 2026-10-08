@@ -1,0 +1,216 @@
+# DeepChatCode — compiled-in defaults.
+#
+# This file is committed to the repository and embedded into the binary with
+# `include_str!`. It is the shared source of truth for values that ship with
+# the package; it is NOT read from disk at runtime. Every key here can be
+# overridden per machine in the user config:
+#
+#   ~/.codewhale/deepchatcode/config.toml   (honors $CODEWHALE_HOME)
+#
+# These values can drift when the DeepSeek Chat web UI changes. Overriding them
+# in the user config lets you patch a broken selector or URL without rebuilding
+# or waiting for a release.
+
+# How the wrapper presents itself while it works.
+#
+#   "show"   — a visible browser, with every prompt driven through the page.
+#   "silent" — a headless browser, with every prompt sent to the API directly.
+#
+# A mode is a *preset* over two independent knobs, `[browser] headless` and
+# `[transport] mode`, applied under your own config — so setting either knob
+# here or in your user config still wins, and the knob you leave alone follows
+# the mode. `show` is the default because a run you can watch is the honest
+# starting point: you can see the page answer, and you can see it ask to be
+# signed in.
+#
+# Sign-in is the one thing neither mode can suppress: when the composer is not
+# there, the browser is reopened VISIBLY in both modes so you can authenticate,
+# and the run carries on afterwards.
+#
+# `silent` asks the site's own completion endpoint first. That endpoint needs a
+# per-request proof-of-work header this project does not synthesize (see
+# [transport] below), so when it refuses, the turn is retried through the
+# headless page and one line on stderr says so. The mode stays quiet either way.
+mode = "show"
+
+[chat]
+# Base chat URL. Naked form opens a brand-new conversation by default; the
+# wrapper navigates to a stored conversation URL instead when one is linked to
+# the active Codewhale session.
+url = "https://chat.deepseek.com"
+# Hosts accepted for --chat-url and for any URL the browser lands on.
+allowed_hosts = ["chat.deepseek.com"]
+# Optional literal substring a captured conversation URL must contain before it
+# is stored as a resumable link (empty = accept any non-base chat URL).
+# DeepSeek routes a specific conversation at /a/chat/s/<id>, so this rejects the
+# bare chat URL that would otherwise look "different enough" to store.
+routed_url_pattern = "/a/chat/s/"
+
+[selectors]
+composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
+assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
+send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
+new_chat = "button[aria-label*='new chat' i], button[title*='new chat' i], [data-testid*='new-chat']"
+search_toggle = "div.ds-toggle-button:has-text('Search')"
+thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
+file_upload = "input[type='file'], button[aria-label*='upload' i], button[aria-label*='attach' i], [data-testid*='upload' i]"
+# The chat page's own mode chips ("DeepThink", "Search"). Their text names the
+# mode and their `--selected` class says whether it is on, which is how a turn
+# is attributed to a model. Verified against chat.deepseek.com; set to "" to
+# disable, and the turn log records the model as "unknown".
+model_label = "div.ds-toggle-button"
+
+[timeouts]
+# How long to wait for the composer to appear (manual sign-in window).
+login_wait_secs = 900
+# How long to wait for the composer in headless mode before deciding sign-in
+# is required and reopening a visible browser.
+login_probe_secs = 20
+# How long to wait for a visible assistant reply.
+response_secs = 300
+# How often to re-read the visible page while waiting for it to settle. Lower
+# is snappier; higher is gentler on the page. 150 ms is the shipped default.
+poll_ms = 150
+# Consecutive identical reads of the newest assistant message that count as
+# "the reply stopped growing". A quiet window, not a completion check: the page
+# renders in bursts, so too small a value ends the turn mid-sentence. At
+# poll_ms = 150 this is ~3 s. Raising it costs a few seconds between the last
+# streamed word and the end of the turn; lowering it risks a half-printed reply,
+# which is what 3 used to do.
+settle_polls = 20
+# Upper bound on a single Playwright action (the library default is 30 s, which
+# turns one awkward element into a dead turn).
+action_secs = 20
+# Upper bound on a single page navigation.
+navigation_secs = 20
+# How long to wait for a linked conversation to render before treating the link
+# as stale and realigning from scratch.
+link_probe_secs = 10
+
+[tools]
+# Forward Codewhale's whole tool catalog to the chat. Set false to send only
+# `essential` + `search`, so the chat does not carry every tool schema and the
+# model discovers the rest through the search tool.
+forward_all = true
+# Tool names always forwarded, even when forward_all = false.
+essential = []
+# Discovery/search tool names, always forwarded.
+search = ["tool_search"]
+# Extra tool-call names to accept even if the request does not declare them
+# (for example MCP tools surfaced later in the conversation).
+allow_extra = []
+
+[relay]
+# Show a desktop notification (notify-send) when the wrapper realigns the
+# browser, for example when a linked conversation is no longer reachable and a
+# new chat is opened instead.
+desktop_notifications = true
+# Forward Codewhale's own system message into the chat. It carries the full
+# project briefing — project context, constitution, skills index — and it is on
+# by default because that briefing *is* the model's context: it makes the model a
+# Codewhale coder with the real workspace in front of it, rather than a model the
+# wrapper describes itself to. The instruction text in assets/system-prompt.md is
+# only the transport contract (prose or a tool-calls object), nothing about how
+# the session is reached. Turn this off to send a smaller prompt.
+forward_system_prompt = true
+
+# Machine-specific values. These have no defaults — set them in your user
+# config, not here.
+[codewhale]
+# binary = "/home/you/.cargo/bin/codewhale"
+# Instruction text sent to the chat model. Unset uses the committed
+# assets/system-prompt.md embedded in the binary. `{project_dir}` and
+# `{payload}` are filled in at runtime.
+# system_prompt = "/path/to/system-prompt.md"
+
+[browser]
+# How the relay gets a browser to drive.
+#
+#   "managed" — launch a dedicated persistent Chromium profile owned by the
+#               wrapper (default; isolated from your everyday browser).
+#   "attach"  — attach to an already-running Chromium over CDP, reusing your
+#               own signed-in session. Start that browser with, for example,
+#               --remote-debugging-port=9222 and set cdp_endpoint below.
+#
+# "managed" is the safe default: it never touches your normal browser profile.
+mode = "managed"
+# Run Chromium headless (managed mode). When the composer does not appear
+# within login_probe_secs, the wrapper reopens a visible window so you can sign
+# in, then polls. Set false to always launch visible.
+headless = true
+# Keep the browser running between turns. When false, the browser is closed
+# after every reply and relaunched for the next turn: it frees memory at the
+# cost of a relaunch (and, in attach mode, a re-attach).
+keep_alive = true
+# How often to check that the browser is still there while the bridge is idle.
+# If it has been closed or has crashed, it is reopened on the conversation in
+# progress, so it comes back in seconds rather than at the next prompt. 0 turns
+# the check off. Ignored when keep_alive = false, where an absent browser is the
+# point.
+liveness_check_secs = 15
+# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# cdp_endpoint = "http://127.0.0.1:9222"
+# Record the managed browser's page to a video. One file per run, written when
+# the browser closes. Handy for demos and for seeing what the page did when a
+# turn failed. Never records the desktop — only the page the wrapper drives.
+# record_video_dir = "/home/you/.codewhale/deepseek-chat/video"
+# record_video_size = "1280x800"
+
+[transport]
+# How a completion is delivered to DeepSeek.
+#
+#   "gui" — drive the visible chat page: type the prompt and read the reply
+#           (default).
+#   "api" — POST to the site's own completion endpoint from inside the page
+#           context, so the signed-in session cookies apply. This is a private
+#           endpoint, not an API contract: it can change without notice and the
+#           shipped defaults are best-effort. Every piece of the request and
+#           response shape is configuration.
+mode = "gui"
+
+[transport.api]
+# Absolute URL or same-origin path POSTed from inside the chat page.
+url = "/api/v0/chat/completion"
+# Request body template. Placeholders:
+#   {messages} — the JSON messages array
+#   {tools}    — the JSON tools array, or null
+#   {payload}  — the whole {"messages":…,"tools":…} object
+#   {prompt}   — the instruction text
+#   {thinking} — true/false, the reasoning state a `deepseek-pro` turn needs
+#
+# `{thinking}` matters: DeepSeek's own body carries `"thinking_enabled"`. A body
+# that never mentions it cannot be told which model to use, so a `deepseek-pro`
+# request over this transport is refused rather than answered by the plain model
+# — and the turn then falls back to the page, where DeepThink is engaged for
+# real. Add the placeholder (for example `"thinking_enabled":{thinking}`) to use
+# the direct API path for pro turns.
+body = "{\"messages\":{messages},\"stream\":true}"
+# Response framing: "sse" (data: lines), "json" (one document), "text".
+framing = "sse"
+# Dot path to the assistant text inside each response object. Empty = the whole
+# body. Examples: "content", "choices.0.message.content".
+text_path = "content"
+# How many seconds to wait for the API call to return.
+timeout_secs = 300
+# Extra request headers, on top of the JSON content type.
+# extra_headers = { "x-client-version" = "2.5.0" }
+#
+# Verified against chat.deepseek.com on 2026-10-08, by reading the page's own
+# traffic (run `cargo test -- --ignored live_discover_api_endpoint` to repeat it):
+#
+#   the URL above is right, but the body is the site's own shape, not OpenAI's:
+#     {"chat_session_id":"<uuid>","parent_message_id":null,
+#      "model_type":"default","prompt":"<text>","ref_file_ids":[],
+#      "thinking_enabled":false,"search_enabled":true,"action":null,
+#      "preempt":false}
+#
+#   and the request carries authorization: Bearer <token> plus three headers the
+#   page derives per request: x-ds-pow-response (a proof-of-work obtained from
+#   POST /api/v0/chat/create_pow_challenge), x-hif-dliq and x-hif-leim.
+#
+# Without the bearer token the endpoint answers {"code":40003,
+# "msg":"INVALID_TOKEN"}; with it, {"code":40300,"msg":"MISSING_HEADER"}.
+# This project does not synthesize the proof-of-work, so `api` mode does not
+# work against DeepSeek today — the page solves its own challenge, which is
+# exactly what `gui` mode drives. `api` remains here for endpoints that need no
+# such header; `extra_headers` above covers a static one.
