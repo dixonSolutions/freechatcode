@@ -122,10 +122,11 @@ what the wrapper does or does not do to a reply.
 ## Install
 
 ```bash
-cargo install deepchatcode
+cargo install --git https://github.com/dixonSolutions/DeepChatCode
 ```
 
-Or from source:
+Not on crates.io yet, so this git install is the one that works today. Or from
+source:
 
 ```bash
 cargo build --release
