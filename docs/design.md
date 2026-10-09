@@ -35,8 +35,7 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
   *delta* Codewhale added since the last assistant message, and feeds the whole
   transcript only when the conversation is new or the link is stale. It keeps no
   copy of the conversation.
-- **A wire adaptation, not a rewrite.** A chat page cannot emit native tool
-  calls, so a reply is read as either prose or a `tool_calls` object — found
+- **A wire adaptation, not a rewrite.** A reply is read as prose, a native DSML invocation, or a `tool_calls` object — found
   wherever the model wrote it, fenced or trailing or after its own reasoning —
   and normalised to the OpenAI shape. The model's words are otherwise carried
   through unchanged.

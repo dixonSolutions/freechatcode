@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::serve;
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -41,45 +41,55 @@ struct Args {
     command: Option<Commands>,
 
     /// Attach to an already-running Chromium via this CDP endpoint.
-    #[arg(long)]
+    #[arg(long, global = true)]
     cdp_endpoint: Option<String>,
 
     /// Chat page to open (defaults to the configured chat URL).
-    #[arg(long)]
+    #[arg(long, global = true)]
     chat_url: Option<String>,
 
     /// Codewhale executable to launch after the browser is ready.
-    #[arg(long, env = "CODEWHALE_BINARY")]
+    #[arg(long, env = "CODEWHALE_BINARY", global = true)]
     codewhale_bin: Option<String>,
 
     /// Agent harness to launch: `codewhale` (default) or `opencode`. Guessed
     /// from the binary's file name when omitted.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     harness: Option<HarnessKind>,
 
     /// Browser profile directory.
-    #[arg(long)]
+    #[arg(long, global = true)]
     profile_dir: Option<PathBuf>,
 
     /// Record the browser's page to a video in this directory (one file per
     /// run). Useful for demos; it never records the desktop, only the page.
-    #[arg(long)]
+    #[arg(long, global = true)]
     record_video: Option<PathBuf>,
 
     /// Recording size for --record-video, as WxH.
-    #[arg(long)]
+    #[arg(long, global = true)]
     record_video_size: Option<String>,
 
     /// How the wrapper presents itself: `show` (a visible browser, prompts
     /// driven through the page) or `silent` (headless, prompts sent to the API
     /// directly). Overrides `mode` in the config file. Sign-in reopens a visible
     /// window in both modes.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     mode: Option<RunMode>,
 
     /// Model to launch the harness with. Defaults to the chat model.
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
+
+    /// Select a provider by name (configures it first when needed).
+    #[arg(long, global = true)]
+    chatmodel: Option<String>,
+    /// Remember the selected provider as the default.
+    #[arg(long, global = true)]
+    make_default: bool,
+    /// Expose all configured models to the harness: --opt=all.
+    #[arg(long, global=true, value_parser=["all"], alias="options")]
+    opt: Option<String>,
 
     /// Arguments passed unchanged to the harness after `--`.
     #[arg(last = true, value_name = "HARNESS_ARGS")]
@@ -88,6 +98,20 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// List, configure, remove, or select chat providers.
+    Chatmodels {
+        #[command(subcommand)]
+        command: ChatModelCommands,
+    },
+    /// File feedback on GitHub; attachments are linked rather than uploaded.
+    Feedback {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+    },
     /// Check the harness binary, the relay, and the browser.
     Health,
     /// Install the Codewhale CLI (the default harness) via cargo.
@@ -110,9 +134,69 @@ enum Commands {
     Launch {
         /// Optional harness executable name or path to track down.
         binary: Option<String>,
+        /// Use the saved default selection (also the default without this flag).
+        #[arg(long)]
+        default: bool,
         /// Arguments passed unchanged to the harness after `--`.
         #[arg(last = true, value_name = "HARNESS_ARGS")]
         codewhale_args: Vec<OsString>,
+    },
+}
+
+#[derive(Debug, ClapArgs)]
+struct ProviderTarget {
+    provider: Option<String>,
+    #[arg(long = "Deepseek", alias = "deepseek")]
+    deepseek: bool,
+    #[arg(long = "Gemini", alias = "gemini")]
+    gemini: bool,
+    #[arg(long = "GoogleAIMode", alias = "google-ai-mode")]
+    google_ai_mode: bool,
+    #[arg(long)]
+    all: bool,
+}
+impl ProviderTarget {
+    fn name(&self) -> Result<String> {
+        let mut names = Vec::new();
+        if let Some(name) = &self.provider {
+            names.push(name.clone());
+        }
+        for (enabled, name) in [
+            (self.deepseek, "deepseek"),
+            (self.gemini, "gemini"),
+            (self.google_ai_mode, "google-ai-mode"),
+            (self.all, "all"),
+        ] {
+            if enabled {
+                names.push(name.into());
+            }
+        }
+        if names.len() != 1 {
+            bail!(
+                "select exactly one provider by name or --Deepseek/--Gemini/--GoogleAIMode/--all"
+            );
+        }
+        Ok(names.remove(0))
+    }
+}
+#[derive(Debug, Subcommand)]
+enum ChatModelCommands {
+    List,
+    Configure {
+        #[command(flatten)]
+        target: ProviderTarget,
+    },
+    Drop {
+        #[command(flatten)]
+        target: ProviderTarget,
+    },
+    ReConfigure {
+        #[command(flatten)]
+        target: ProviderTarget,
+    },
+    SetDefault {
+        #[command(flatten)]
+        target: ProviderTarget,
     },
 }
 
@@ -205,6 +289,8 @@ fn codewhale_intent(args: &[OsString]) -> Intent {
 /// Wraps the browser so the first successful reply records the visible
 /// conversation URL against the active Codewhale session.
 struct UrlLinkingChat {
+    harness: String,
+    identity: Option<freechatcode::ConversationIdentity>,
     inner: Arc<BrowserChat>,
     links: Arc<SessionLinks>,
     session: Option<String>,
@@ -212,7 +298,6 @@ struct UrlLinkingChat {
     workspace: PathBuf,
     chat: ChatConfig,
     provider_id: String,
-    linked: AtomicBool,
     /// Set by the startup warm-up when the linked conversation turned out not to
     /// exist. Checked once, on the first turn: the browser is warmed in parallel
     /// with Codewhale's own boot, so this answer arrives after the relay is
@@ -221,6 +306,19 @@ struct UrlLinkingChat {
 }
 
 impl UrlLinkingChat {
+    fn record_agent_message(&self, prompt: &str, reply: &str) {
+        if let Some(id) = &self.identity
+            && let Err(error) = self.links.record_agent_message(
+                &id.session_id,
+                &id.agent_id,
+                &self.provider_id,
+                prompt.len(),
+                reply.len(),
+            )
+        {
+            eprintln!("freechatcode: could not record agent message: {error}");
+        }
+    }
     /// Whether the linked conversation is gone, consumed once.
     ///
     /// A stale link means this turn must start a fresh chat: the relay decided
@@ -233,26 +331,61 @@ impl UrlLinkingChat {
     /// Record the current conversation URL once it can be attributed to a
     /// session. Returns whether the link is now stored.
     async fn try_link(&self) -> bool {
-        if self.linked.load(Ordering::SeqCst) {
-            return true;
-        }
         let Some(url) = self.inner.live_url().await else {
             return false;
         };
         if !self.chat.is_resumable_url(&url) {
             return false;
         }
-        let session = self
-            .session
-            .clone()
-            .or_else(|| sessions::active_session_id(&self.sessions_dir, &self.workspace));
+        let session = self.session.clone().or_else(|| {
+            (self.harness == "codewhale")
+                .then(|| sessions::active_session_id(&self.sessions_dir, &self.workspace))
+                .flatten()
+        });
         let Some(session) = session else {
             return false;
         };
-        match self.links.upsert(&session, &self.provider_id, &url) {
+        let previous = if let Some(identity) = &self.identity {
+            self.links
+                .agent_url(&identity.session_id, &identity.agent_id, &self.provider_id)
+        } else {
+            self.links.get(&session, &self.provider_id)
+        };
+        if previous.ok().flatten().as_deref() == Some(&url) {
+            return true;
+        }
+        let result = if let Some(identity) = &self.identity {
+            self.links
+                .link_agent(
+                    &identity.session_id,
+                    &identity.agent_id,
+                    &self.provider_id,
+                    &url,
+                )
+                .and_then(|()| {
+                    if identity.agent_id.is_empty() {
+                        self.links
+                            .upsert(&identity.session_id, &self.provider_id, &url)
+                    } else {
+                        Ok(())
+                    }
+                })
+        } else {
+            self.links.upsert(&session, &self.provider_id, &url)
+        };
+        match result {
             Ok(()) => {
-                eprintln!("Linked Codewhale session {session} to {url}");
-                self.linked.store(true, Ordering::SeqCst);
+                let title = match &self.identity {
+                    Some(id) if !id.agent_id.is_empty() => format!(
+                        "[{}] sub_agent session_id:{} sub_agent_id:{}",
+                        self.harness, id.session_id, id.agent_id
+                    ),
+                    _ => format!("[{}] session_id:{session}", self.harness),
+                };
+                if let Err(error) = self.inner.rename_conversation(&title).await {
+                    eprintln!("freechatcode: session linked; could not rename chat: {error}");
+                }
+                eprintln!("Linked {} session {session} to {url}", self.harness);
                 true
             }
             Err(error) => {
@@ -265,12 +398,72 @@ impl UrlLinkingChat {
 
 #[async_trait::async_trait]
 impl ChatUi for UrlLinkingChat {
+    async fn resuming(&self) -> bool {
+        !self.inner.resume_url.lock().await.is_empty()
+    }
+    async fn prepare_turn(&self, start_new_chat: bool) -> Result<bool, String> {
+        self.inner
+            .prepare_turn(start_new_chat || self.take_stale_link())
+            .await
+    }
+    async fn fork(
+        self: Arc<Self>,
+        identity: &freechatcode::ConversationIdentity,
+    ) -> Result<Arc<dyn ChatUi>, String> {
+        let mut resolved = identity.clone();
+        if self.harness == "codewhale"
+            && resolved.agent_id.is_empty()
+            && resolved.session_id.starts_with("run-")
+            && let Some(session) = sessions::active_session_id(&self.sessions_dir, &self.workspace)
+        {
+            resolved.session_id = session;
+        }
+        let identity = &resolved;
+        let inner = self.inner.fork_browser();
+        if let Some(url) = self
+            .links
+            .agent_url(&identity.session_id, &identity.agent_id, &self.provider_id)?
+            .or_else(|| {
+                if identity.agent_id.is_empty() {
+                    self.links
+                        .get(&identity.session_id, &self.provider_id)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                }
+            })
+            && self.chat.is_resumable_url(&url)
+        {
+            *inner.resume_url.lock().await = url;
+        }
+        Ok(Arc::new(Self {
+            harness: self.harness.clone(),
+            identity: Some(identity.clone()),
+            inner,
+            links: Arc::clone(&self.links),
+            session: Some(identity.session_id.clone()),
+            sessions_dir: self.sessions_dir.clone(),
+            workspace: self.workspace.clone(),
+            chat: self.chat.clone(),
+            provider_id: self.provider_id.clone(),
+            stale_link: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+
+    async fn close(&self) {
+        self.inner.shutdown().await;
+    }
+    async fn set_model_state(&self, toggles: &[config::Toggle]) -> Result<(), String> {
+        self.inner.set_model_state(toggles).await
+    }
     async fn send(&self, prompt: &str, start_new_chat: bool) -> Result<String, String> {
         let reply = self
             .inner
             .send(prompt, start_new_chat || self.take_stale_link())
             .await?;
         self.try_link().await;
+        self.record_agent_message(prompt, &reply);
         Ok(reply)
     }
 
@@ -285,6 +478,7 @@ impl ChatUi for UrlLinkingChat {
             .send_streaming(prompt, start_new_chat || self.take_stale_link(), snapshots)
             .await?;
         self.try_link().await;
+        self.record_agent_message(prompt, &reply);
         Ok(reply)
     }
 
@@ -635,6 +829,7 @@ async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Resul
         None => config.providers.iter().collect(),
     };
     let cdp_endpoint = config.browser.cdp_endpoint.clone();
+    let mut failures = 0;
     for provider in providers {
         println!("Checking provider {} ({})…", provider.name, provider.id);
         let browser = make_browser(
@@ -651,6 +846,7 @@ async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Resul
                 browser.shutdown().await;
             }
             Err(error) => {
+                failures += 1;
                 let failure = browser.classify(&error).await;
                 println!(
                     "  FAILED [{} / {}]: {}",
@@ -658,6 +854,128 @@ async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Resul
                     failure.blame,
                     first_line(&error)
                 );
+            }
+        }
+    }
+    if failures > 0 {
+        bail!("{failures} provider check(s) failed");
+    }
+    Ok(())
+}
+
+async fn configure_provider(home: &Path, config: &mut Config, name: &str) -> Result<()> {
+    let id = freechatcode::providers::canonical(name);
+    let provider = config
+        .provider(&id)
+        .cloned()
+        .or_else(|| {
+            freechatcode::providers::catalog()
+                .into_iter()
+                .find(|p| p.id == id)
+        })
+        .context("unknown provider; use chatmodels list")?;
+    let mut visible = config.clone();
+    visible.browser.headless = false;
+    visible.browser.cdp_endpoint = None;
+    visible.browser.mode = config::BrowserMode::Managed;
+    let browser = make_browser(
+        &visible,
+        &provider,
+        home,
+        None,
+        None,
+        provider.chat.url.clone(),
+    );
+    println!(
+        "Configuring {}. Sign in in Chromium; the profile is saved per provider.",
+        provider.name
+    );
+    let result = browser.ensure_open().await;
+    browser.shutdown().await;
+    result.map_err(anyhow::Error::msg)?;
+    if config.provider(&id).is_none() {
+        config.providers.push(provider);
+    }
+    if config.default_provider.is_none() {
+        config.default_provider = config.providers.first().map(|p| p.id.clone());
+    }
+    config::save_providers(&config::user_config_path(home), config).map_err(anyhow::Error::msg)?;
+    println!(
+        "Configured {id}; composer verified. Use doctor and a real turn to verify reply selectors."
+    );
+    Ok(())
+}
+
+async fn run_chatmodels(home: &Path, command: ChatModelCommands) -> Result<()> {
+    let path = config::user_config_path(home);
+    let mut config = Config::load(Some(&path)).map_err(anyhow::Error::msg)?;
+    let reconfigure = matches!(&command, ChatModelCommands::ReConfigure { .. });
+    match command {
+        ChatModelCommands::List => {
+            println!("=== All chat models and providers ===\n=configured=");
+            for p in &config.providers {
+                let default = config
+                    .default_model_id()
+                    .and_then(|m| config.model(m))
+                    .is_some_and(|(provider, _)| provider.id == p.id);
+                println!(
+                    "{}{}: {}",
+                    p.name,
+                    if default { " *default" } else { "" },
+                    p.models
+                        .iter()
+                        .map(|m| m.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if config.default_all {
+                println!("All configured is default");
+            }
+            println!("=not-configured=");
+            for p in freechatcode::providers::catalog()
+                .iter()
+                .filter(|p| config.provider(&p.id).is_none())
+            {
+                println!(
+                    "{}{}",
+                    p.name,
+                    if p.id == "google-ai-mode" {
+                        " (experimental template)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            println!("Configure with: freechatcode chatmodels configure <provider>");
+        }
+        ChatModelCommands::Configure { target } => {
+            configure_provider(home, &mut config, &target.name()?).await?
+        }
+        ChatModelCommands::SetDefault { target } => {
+            freechatcode::providers::select_default(&mut config, &target.name()?)
+                .map_err(anyhow::Error::msg)?;
+            config::save_providers(&path, &config).map_err(anyhow::Error::msg)?;
+        }
+        ChatModelCommands::Drop { target } | ChatModelCommands::ReConfigure { target } => {
+            let name = target.name()?;
+            let id = freechatcode::providers::drop_provider(&mut config, &name)
+                .map_err(anyhow::Error::msg)?;
+            config::save_providers(&path, &config).map_err(anyhow::Error::msg)?;
+            let profile = home.join("providers").join(&id).join("browser");
+            if browser::profile_holder(&profile).is_some() {
+                bail!(
+                    "configuration dropped; close Chromium before removing its signed-in profile at {}",
+                    profile.display()
+                );
+            }
+            if profile.exists() {
+                tokio::fs::remove_dir_all(&profile)
+                    .await
+                    .context("remove provider sign-in profile")?;
+            }
+            if reconfigure {
+                configure_provider(home, &mut config, &id).await?;
             }
         }
     }
@@ -704,13 +1022,57 @@ async fn set_private_file(path: &Path) -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let args = Args::parse();
+    let mut forwarded = false;
+    let arguments = std::env::args_os().map(|argument| {
+        if argument == "--" {
+            forwarded = true;
+        }
+        if !forwarded && argument == "-opt=all" {
+            std::ffi::OsString::from("--opt=all")
+        } else {
+            argument
+        }
+    });
+    let args = Args::parse_from(arguments);
     // Resolve the home and run the one-time directory migration *before* any
     // subcommand can create a provider directory of its own.
     let home = default_home()?;
     migrate_provider_dirs(&home);
 
     let (binary_hint, codewhale_args) = match args.command {
+        Some(Commands::Chatmodels { command }) => {
+            run_chatmodels(&home, command).await?;
+            return Ok(());
+        }
+        Some(Commands::Feedback {
+            title,
+            body,
+            body_file,
+        }) => {
+            let mut command = Command::new("gh");
+            command.args([
+                "issue",
+                "create",
+                "--repo",
+                "dixonSolutions/freechatcode",
+                "--title",
+                &title,
+            ]);
+            if let Some(path) = body_file {
+                command.arg("--body-file").arg(path);
+            } else {
+                command.args(["--body", body.as_deref().unwrap_or("")]);
+            }
+            if !command
+                .status()
+                .await
+                .context("run gh; install GitHub CLI and sign in with gh auth login")?
+                .success()
+            {
+                bail!("GitHub could not create the feedback issue");
+            }
+            return Ok(());
+        }
         Some(Commands::Health) => {
             let report = health::check_all(args.codewhale_bin.as_deref(), None, None).await;
             println!("Codewhale binary: {:?}", report.codewhale_binary);
@@ -741,6 +1103,7 @@ async fn run() -> Result<()> {
         Some(Commands::Launch {
             binary,
             codewhale_args,
+            default: _,
         }) => (binary, codewhale_args),
         None => (None, args.codewhale_args.clone()),
     };
@@ -748,6 +1111,19 @@ async fn run() -> Result<()> {
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(name) = &args.chatmodel {
+        let id = freechatcode::providers::canonical(name);
+        if config.provider(&id).is_none() {
+            configure_provider(&home, &mut config, &id).await?;
+        }
+        if args.make_default {
+            freechatcode::providers::select_default(&mut config, &id)
+                .map_err(anyhow::Error::msg)?;
+            config::save_providers(&config_path, &config).map_err(anyhow::Error::msg)?;
+        }
+    } else if args.make_default {
+        bail!("--make-default requires --chatmodel");
+    }
     // CLI flags beat the config file for the two recording knobs.
     if let Some(dir) = args.record_video.clone() {
         config.browser.record_video_dir = Some(dir.to_string_lossy().into_owned());
@@ -763,6 +1139,13 @@ async fn run() -> Result<()> {
     let model_id = args
         .model
         .clone()
+        .or_else(|| {
+            args.chatmodel
+                .as_ref()
+                .and_then(|name| config.provider(&freechatcode::providers::canonical(name)))
+                .and_then(|p| p.models.first())
+                .map(|m| m.id.clone())
+        })
         .or_else(|| config.default_model_id().map(str::to_owned))
         .context("no provider or model is configured")?;
     let (active_provider, _) = config.model(&model_id).ok_or_else(|| {
@@ -777,6 +1160,17 @@ async fn run() -> Result<()> {
         )
     })?;
     let provider = active_provider.clone();
+    let expose_all = args.opt.is_some()
+        || (args.chatmodel.is_none() && args.model.is_none() && config.default_all);
+    println!(
+        "Launching with {}: {}",
+        if expose_all {
+            "all configured models"
+        } else {
+            "selected model"
+        },
+        model_id
+    );
 
     // Effective values: CLI flag > environment (merged by clap) > config > default.
     let chat_url = args
@@ -814,6 +1208,9 @@ async fn run() -> Result<()> {
         setup::find_codewhale_binary(None)?
     };
     println!("Using codewhale binary: {}", codewhale_bin.display());
+    let harness_kind = args
+        .harness
+        .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin));
     if pinned.is_none()
         && let Err(error) = config::remember_binary(&config_path, &codewhale_bin)
     {
@@ -834,12 +1231,16 @@ async fn run() -> Result<()> {
         SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
             .map_err(|error| anyhow::anyhow!(error))?,
     );
-    let session = match codewhale_intent(&codewhale_args) {
-        Intent::Fresh => None,
-        Intent::Session(hint) => {
-            sessions::resolve_session_id(&sessions_dir, &workspace, Some(&hint))
+    let session = if harness_kind != HarnessKind::Codewhale {
+        None
+    } else {
+        match codewhale_intent(&codewhale_args) {
+            Intent::Fresh => None,
+            Intent::Session(hint) => {
+                sessions::resolve_session_id(&sessions_dir, &workspace, Some(&hint))
+            }
+            Intent::Auto => sessions::resolve_session_id(&sessions_dir, &workspace, None),
         }
-        Intent::Auto => sessions::resolve_session_id(&sessions_dir, &workspace, None),
     };
 
     // Take the terminal off the wrapper's stdin *before* any browser exists, so
@@ -857,7 +1258,11 @@ async fn run() -> Result<()> {
         .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from));
     let mut route_groups: Vec<RouteGroup> = Vec::new();
     let mut browsers: Vec<Arc<BrowserChat>> = Vec::new();
-    for entry in &config.providers {
+    for entry in config
+        .providers
+        .iter()
+        .filter(|p| expose_all || p.id == provider.id)
+    {
         // `--chat-url` overrides the active provider's base URL; every other
         // provider opens at its configured URL.
         let base_url = if entry.id == provider.id {
@@ -869,7 +1274,13 @@ async fn run() -> Result<()> {
         // provider's host; anything else is treated as no link at all.
         let linked_url = session
             .as_ref()
-            .and_then(|id| links.get(id, &entry.id).ok().flatten())
+            .and_then(|id| {
+                links
+                    .agent_url(id, "", &entry.id)
+                    .ok()
+                    .flatten()
+                    .or_else(|| links.get(id, &entry.id).ok().flatten())
+            })
             .filter(|url| entry.chat.is_resumable_url(url));
         let had_link = linked_url.is_some();
         if let Some(url) = &linked_url {
@@ -889,7 +1300,11 @@ async fn run() -> Result<()> {
             &config,
             entry,
             &home,
-            profile_override.clone(),
+            if entry.id == provider.id {
+                profile_override.clone()
+            } else {
+                None
+            },
             cdp_endpoint.clone(),
             open_url,
         ));
@@ -959,6 +1374,13 @@ async fn run() -> Result<()> {
         }
 
         let ui = Arc::new(UrlLinkingChat {
+            harness: format!(
+                "{:?}",
+                args.harness
+                    .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin))
+            )
+            .to_ascii_lowercase(),
+            identity: None,
             inner: Arc::clone(&browser),
             links: Arc::clone(&links),
             session: session.clone(),
@@ -966,12 +1388,12 @@ async fn run() -> Result<()> {
             workspace: workspace.clone(),
             chat: entry.chat.clone(),
             provider_id: entry.id.clone(),
-            linked: AtomicBool::new(false),
             stale_link: Arc::clone(&stale_link),
         });
         let models: Vec<ModelSpec> = entry
             .models
             .iter()
+            .filter(|model| expose_all || model.id == model_id)
             .map(|model| ModelSpec {
                 id: model.id.clone(),
                 owned_by: entry.id.clone(),
@@ -1017,12 +1439,22 @@ async fn run() -> Result<()> {
                 start_fresh: false,
             },
         )
-        .with_turns(turns),
+        .with_turns(turns)
+        .with_default_conversation(freechatcode::ConversationIdentity {
+            session_id: session
+                .clone()
+                .unwrap_or_else(|| format!("run-{}", Uuid::new_v4())),
+            agent_id: String::new(),
+        }),
     );
     let server = tokio::spawn(async move { serve(listener, app).await });
     let base_url = format!("http://{address}/v1");
 
-    println!("Starting Codewhale with the chat browser route.");
+    let harness_name = match harness_kind {
+        HarnessKind::Codewhale => "Codewhale",
+        HarnessKind::Opencode => "opencode",
+    };
+    println!("Starting {harness_name} with the chat browser route.");
     println!("The local relay listens only on {address}; no browser CORS access is enabled.");
     println!("Platform credentials and cookies remain in the browser profile.");
     println!(
@@ -1067,11 +1499,21 @@ async fn run() -> Result<()> {
         Some(terminal) => Stdio::from(terminal),
         None => Stdio::inherit(),
     };
-    let harness_kind = args
-        .harness
-        .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin));
-    let spawn = harness::spawn_contract(harness_kind, &base_url, &token, &model_id)?;
+    let served_models: Vec<String> = config
+        .all_models()
+        .into_iter()
+        .filter(|(id, _)| expose_all || id == &model_id)
+        .map(|(id, _)| id)
+        .collect();
+    let spawn = harness::spawn_contract_with_models(
+        harness_kind,
+        &base_url,
+        &token,
+        &model_id,
+        &served_models,
+    )?;
     let mut command = Command::new(&codewhale_bin);
+    command.env("PWD", &workspace);
     command.args(&spawn.argv);
     for (key, value) in &spawn.envs {
         command.env(key, value);
@@ -1092,10 +1534,6 @@ async fn run() -> Result<()> {
     // The harness's stdio was duplicated above, so it keeps the terminal. The
     // wrapper gives up its own now, so nothing it writes can land on the TUI.
     let mut handover = ScreenHandover::take(log_path.clone());
-    let harness_name = match harness_kind {
-        HarnessKind::Codewhale => "Codewhale",
-        HarnessKind::Opencode => "opencode",
-    };
     eprintln!(
         "freechatcode: {harness_name} started at {:.2}s (browser warming in parallel)",
         startup.elapsed().as_secs_f64()
@@ -1194,6 +1632,227 @@ mod tests {
     }
 
     const TEST_MODEL_ID: &str = "deepseek-chat";
+    #[tokio::test]
+    #[ignore = "needs a signed-in DeepSeek profile and network access"]
+    async fn live_file_and_image_attachments_are_read_by_the_chat() {
+        use base64::Engine;
+        let mut config = Config::defaults();
+        config.browser.headless = true;
+        let (dir, profile) = profile_copy();
+        let path = dir.path().join("attachment.txt");
+        std::fs::write(&path, "ATTACHMENT-CHECK-7391").unwrap();
+        let ui = make_browser(
+            &config,
+            &config.providers[0],
+            dir.path(),
+            Some(profile),
+            None,
+            config.providers[0].chat.url.clone(),
+        );
+        let image = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../tests/fixtures/attachment.png"));
+        let prompt = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"Read the attached text file and image. Reply with only the two tokens inside those attachments, one per line."},
+            {"type":"file","file":{"path":path,"filename":"attachment.txt","mime_type":"text/plain"}},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{image}")}}
+        ]}]}).to_string();
+        let reply = ui.send(&prompt, true).await;
+        ui.shutdown().await;
+        let reply = reply.unwrap();
+        assert!(reply.contains("ATTACHMENT-CHECK-7391"), "{reply}");
+        assert!(reply.contains("IMAGE-CHECK-8532"), "{reply}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs network access to the Gemini web app"]
+    async fn live_gemini_browser_round_trip() {
+        let mut config = Config::defaults();
+        config.browser.headless = true;
+        config.timeouts.response_secs = 90;
+        let provider = freechatcode::providers::catalog()
+            .into_iter()
+            .find(|p| p.id == "gemini")
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ui = make_browser(
+            &config,
+            &provider,
+            home.path(),
+            None,
+            None,
+            provider.chat.url.clone(),
+        );
+        ui.ensure_open().await.unwrap();
+        let reply = ui
+            .send(
+                "Reply with exactly GEMINI-BRIDGE-CHECK and nothing else.",
+                true,
+            )
+            .await;
+        ui.shutdown().await;
+        assert_eq!(reply.unwrap(), "GEMINI-BRIDGE-CHECK");
+    }
+    #[tokio::test]
+    #[ignore = "needs a signed-in DeepSeek profile and network access"]
+    async fn live_independent_agent_tabs_answer_in_parallel() {
+        let mut config = Config::defaults();
+        config.browser.headless = true;
+        let (dir, profile) = profile_copy();
+        let parent = Arc::new(make_browser(
+            &config,
+            &config.providers[0],
+            dir.path(),
+            Some(profile),
+            None,
+            config.providers[0].chat.url.clone(),
+        ));
+        let a = parent.fork_browser();
+        let b = parent.fork_browser();
+        let (one, two) = tokio::join!(
+            a.send("Reply with exactly LIVE-AGENT-ONE.", true),
+            b.send("Reply with exactly LIVE-AGENT-TWO.", true)
+        );
+        let urls = (a.live_url().await, b.live_url().await);
+        a.shutdown().await;
+        b.shutdown().await;
+        parent.shutdown().await;
+        assert_eq!(one.unwrap(), "LIVE-AGENT-ONE");
+        assert_eq!(two.unwrap(), "LIVE-AGENT-TWO");
+        assert!(urls.0.is_some() && urls.1.is_some());
+        assert_ne!(urls.0, urls.1);
+    }
+    #[tokio::test]
+    async fn independent_agent_tabs_keep_the_parent_alive() {
+        use base64::Engine;
+        let playwright = Playwright::launch().await.unwrap();
+        let browser = playwright.chromium().launch().await.unwrap();
+        let context = browser.new_context().await.unwrap();
+        let page = context.new_page().await.unwrap();
+        let html = r#"<textarea></textarea><button type=submit onclick="const t=document.querySelector('textarea');const d=document.createElement('div');d.className='ds-markdown';d.textContent=t.value;t.value='';document.body.append(d)">Send</button>"#;
+        let mut config = Config::defaults();
+        config.providers[0].chat.url = format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(html)
+        );
+        config.timeouts.poll_ms = 10;
+        config.timeouts.settle_polls = 2;
+        let home = tempfile::tempdir().unwrap();
+        let parent = Arc::new(make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        ));
+        *parent.session.lock().await = Some(
+            Session::new(page, playwright, context.clone(), false)
+                .await
+                .unwrap(),
+        );
+        let a = parent.fork_browser();
+        let b = parent.fork_browser();
+        let (one, two) = tokio::join!(a.send("AGENT-ONE", false), b.send("AGENT-TWO", false));
+        assert_eq!(one.unwrap(), "AGENT-ONE");
+        assert_eq!(two.unwrap(), "AGENT-TWO");
+        assert_eq!(context.pages().len(), 3);
+        a.shutdown().await;
+        assert_eq!(context.pages().iter().filter(|p| !p.is_closed()).count(), 2);
+        assert!(parent.session.lock().await.as_ref().unwrap().is_alive());
+        assert_eq!(b.send("STILL-TWO", false).await.unwrap(), "STILL-TWO");
+        b.shutdown().await;
+        parent.session.lock().await.as_mut().unwrap().managed = true;
+        let mut ephemeral = parent.fork_browser();
+        Arc::get_mut(&mut ephemeral).unwrap().keep_alive = false;
+        assert_eq!(
+            ephemeral.send("EPHEMERAL", false).await.unwrap(),
+            "EPHEMERAL"
+        );
+        assert!(ephemeral.session.lock().await.is_none());
+        assert!(parent.session.lock().await.is_none());
+        let _ = browser.close().await;
+        parent.shutdown().await;
+    }
+    #[tokio::test]
+    async fn attachments_reach_the_browser_file_input() {
+        let playwright = Playwright::launch().await.unwrap();
+        let browser = playwright.chromium().launch().await.unwrap();
+        let page = browser.new_page().await.unwrap();
+        page.set_content("<input type=file multiple style='display:none'>", None)
+            .await
+            .unwrap();
+        let config = Config::defaults();
+        let home = tempfile::tempdir().unwrap();
+        let ui = make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        );
+        let prompt = serde_json::json!({"messages":[{"content":[{"type":"file","file":{"filename":"note.txt","file_data":"data:text/plain;base64,RklMRS1UT0tFTg=="}}]}]}).to_string();
+        ui.upload_attachments(&page, &prompt).await.unwrap();
+        let value = page.evaluate::<(), Value>("async () => { const f = document.querySelector('input').files[0]; return {name:f.name,type:f.type,text:await f.text()}; }", None).await.unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"name":"note.txt","type":"text/plain","text":"FILE-TOKEN"})
+        );
+        browser.close().await.unwrap();
+        playwright.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_linking_wrapper_delegates_model_state() {
+        let playwright = Playwright::launch().await.unwrap();
+        let browser = playwright.chromium().launch().await.unwrap();
+        let context = browser.new_context().await.unwrap();
+        let page = context.new_page().await.unwrap();
+        page.set_content("<button class='mode' aria-pressed='false' onclick=\"this.setAttribute('aria-pressed',this.getAttribute('aria-pressed')==='true'?'false':'true')\">Think</button>",None).await.unwrap();
+        let config = Config::defaults();
+        let home = tempfile::tempdir().unwrap();
+        let inner = Arc::new(make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        ));
+        *inner.session.lock().await = Some(
+            Session::new(page.clone(), playwright, context, false)
+                .await
+                .unwrap(),
+        );
+        let ui = UrlLinkingChat {
+            harness: "test".into(),
+            identity: None,
+            inner,
+            links: Arc::new(SessionLinks::open(&home.path().join("sessions.db")).unwrap()),
+            session: Some("s".into()),
+            sessions_dir: home.path().into(),
+            workspace: home.path().into(),
+            chat: config.providers[0].chat.clone(),
+            provider_id: "deepseek".into(),
+            stale_link: Arc::new(AtomicBool::new(false)),
+        };
+        ui.set_model_state(&[Toggle {
+            selector: ".mode".into(),
+            on: true,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(chip_is_selected(&page, ".mode").await, Some(true));
+        ui.set_model_state(&[Toggle {
+            selector: ".mode".into(),
+            on: false,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(chip_is_selected(&page, ".mode").await, Some(false));
+        browser.close().await.unwrap();
+        ui.inner.shutdown().await;
+    }
     const TEST_PRO_MODEL_ID: &str = "deepseek-pro";
 
     #[test]
@@ -1374,18 +2033,13 @@ mod tests {
     fn the_pages_reasoning_is_excluded_from_every_alternative_of_the_reply_selector() {
         let selectors = Config::defaults().providers[0].selectors.clone();
         let selector = browser::reply_selector(&selectors);
-        let alternatives: Vec<&str> = selector.split(',').map(str::trim).collect();
         assert_eq!(
-            alternatives.len(),
-            selectors.assistant.split(',').count(),
-            "one alternative in, one out: {selector}"
+            selector,
+            format!(
+                ":is({}):not(:is(.ds-think-content)):not(:is(.ds-think-content) *)",
+                selectors.assistant
+            )
         );
-        for alternative in &alternatives {
-            assert!(
-                alternative.ends_with(":not(.ds-think-content):not(.ds-think-content *)"),
-                "every alternative must exclude the reasoning block and its contents: {alternative}"
-            );
-        }
 
         // A provider that renders no reasoning gets its selector back untouched.
         let mut plain = selectors.clone();
@@ -1457,6 +2111,7 @@ mod tests {
 
         let config = Config::defaults();
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -1535,6 +2190,7 @@ mod tests {
 
         let config = Config::defaults();
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -1599,6 +2255,7 @@ mod tests {
 
         let config = Config::defaults();
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -1707,15 +2364,17 @@ mod tests {
 
         install_crypto_provider();
         let home = default_home().expect("codewhale home");
+        let (_profile_dir, profile) = profile_copy();
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = false;
         let workspace = std::env::current_dir().expect("cwd");
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: provider_profile(&home),
+                profile: profile.clone(),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -1843,14 +2502,16 @@ mod tests {
         use std::sync::Mutex as StdMutex;
 
         let home = default_home().expect("codewhale home");
+        let (_profile_dir, profile) = profile_copy();
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = false;
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: provider_profile(&home),
+                profile: profile.clone(),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -2012,6 +2673,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2110,6 +2772,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2231,6 +2894,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2374,6 +3038,7 @@ mod tests {
         assert_eq!(config.transport.mode, TransportMode::Api);
 
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2431,6 +3096,7 @@ mod tests {
         );
 
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2508,6 +3174,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2621,6 +3288,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -2768,8 +3436,8 @@ mod tests {
         let profile_dir = deps.parent().expect("profile directory");
         let target = profile_dir.parent().unwrap_or(profile_dir);
         let cli = [
-            target.join("release/freechatcode"),
             profile_dir.join("freechatcode"),
+            target.join("release/freechatcode"),
         ]
         .into_iter()
         .find(|candidate| candidate.exists())
@@ -2796,7 +3464,14 @@ mod tests {
         args: &[&str],
     ) -> std::process::Output {
         let run = tokio::process::Command::new(cli)
-            .args(["--mode", "silent"])
+            .args([
+                "--mode",
+                "silent",
+                "--harness",
+                "codewhale",
+                "--codewhale-bin",
+            ])
+            .arg(setup::resolve_codewhale_binary("codewhale").expect("installed codewhale"))
             .arg("--profile-dir")
             .arg(profile)
             .args(["--", "exec", "--auto"])
@@ -3020,6 +3695,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true; // no window pop-ups for this one
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3077,6 +3753,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = false;
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3221,6 +3898,7 @@ mod tests {
         let mut config = Config::defaults();
         config.providers[0].chat.url = url.to_owned();
         BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3330,6 +4008,7 @@ mod tests {
         }
 
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3484,6 +4163,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true; // no window pop-ups for this one
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3561,6 +4241,7 @@ mod tests {
         let (_profile_dir, profile) = profile_copy();
 
         let ui = Arc::new(BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
@@ -3636,6 +4317,7 @@ mod tests {
     #[ignore = "needs a signed-in DeepSeek Chat profile; run with -- --ignored --nocapture"]
     async fn live_bridge_round_trip() {
         let home = default_home().expect("codewhale home");
+        let (_profile_dir, profile) = profile_copy();
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         // A visible window so a signed-out profile can be signed in by hand.
         config.browser.headless = false;
@@ -3662,11 +4344,12 @@ mod tests {
         let start_fresh = linked.is_none();
 
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: linked.unwrap_or_else(|| config.providers[0].chat.url.clone()),
-                profile: provider_profile(&home),
+                profile: profile.clone(),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -3734,11 +4417,12 @@ mod tests {
         ui.shutdown().await;
 
         let resumed = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: conversation.clone(),
-                profile: provider_profile(&home),
+                profile: profile.clone(),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -4273,6 +4957,7 @@ mod tests {
 
         let config = Config::defaults();
         let ui = BrowserChat {
+            parent: None,
             spec: BrowserSpec {
                 config: config.clone(),
                 provider: config.providers[0].clone(),

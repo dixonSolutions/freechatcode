@@ -35,8 +35,25 @@ impl SessionLinks {
         }
         let conn = Connection::open(path)
             .map_err(|error| format!("open session database {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("restrict session database: {e}"))?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS agent_links (
+                 session_id TEXT NOT NULL, agent_id TEXT NOT NULL, provider_id TEXT NOT NULL,
+                 chat_url TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (session_id, agent_id, provider_id)
+             );
+             CREATE TABLE IF NOT EXISTS agent_messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                 agent_id TEXT NOT NULL, provider_id TEXT NOT NULL, chat_url TEXT,
+                 prompt_bytes INTEGER NOT NULL, reply_bytes INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
              -- Two bridges (or a reader) can touch this file at once; wait rather
              -- than failing a turn over a lock.
              PRAGMA busy_timeout = 5000;
@@ -94,6 +111,40 @@ impl SessionLinks {
             )),
             None => Ok(None),
         }
+    }
+
+    pub fn agent_url(
+        &self,
+        session: &str,
+        agent: &str,
+        provider: &str,
+    ) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn.lock().map_err(|_| "session database lock poisoned")?
+            .query_row("SELECT chat_url FROM agent_links WHERE session_id=?1 AND agent_id=?2 AND provider_id=?3", rusqlite::params![session,agent,provider], |r| r.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn link_agent(
+        &self,
+        session: &str,
+        agent: &str,
+        provider: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        self.conn.lock().map_err(|_| "session database lock poisoned")?
+            .execute("INSERT INTO agent_links VALUES (?1,?2,?3,?4,?5) ON CONFLICT(session_id,agent_id,provider_id) DO UPDATE SET chat_url=excluded.chat_url, updated_at=excluded.updated_at", rusqlite::params![session,agent,provider,url,unix_seconds()]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub fn record_agent_message(
+        &self,
+        session: &str,
+        agent: &str,
+        provider: &str,
+        prompt_bytes: usize,
+        reply_bytes: usize,
+    ) -> Result<(), String> {
+        let url = self.agent_url(session, agent, provider)?;
+        self.conn.lock().map_err(|_|"session database lock poisoned")?.execute("INSERT INTO agent_messages (session_id,agent_id,provider_id,chat_url,prompt_bytes,reply_bytes,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![session,agent,provider,url,prompt_bytes as i64,reply_bytes as i64,unix_seconds()]).map(|_|()).map_err(|e|e.to_string())
     }
 
     /// Insert or update the conversation URL for `session_id` on `provider_id`.
@@ -384,6 +435,31 @@ pub fn resolve_session_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_in_different_sessions_keep_independent_links_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.db");
+        let links = super::SessionLinks::open(&path).unwrap();
+        links.link_agent("s1", "a", "p", "https://chat/a").unwrap();
+        links.link_agent("s2", "a", "p", "https://chat/b").unwrap();
+        links
+            .link_agent("s1", "", "p", "https://chat/main")
+            .unwrap();
+        drop(links);
+        let links = super::SessionLinks::open(&path).unwrap();
+        assert_eq!(
+            links.agent_url("s1", "a", "p").unwrap().as_deref(),
+            Some("https://chat/a")
+        );
+        assert_eq!(
+            links.agent_url("s2", "a", "p").unwrap().as_deref(),
+            Some("https://chat/b")
+        );
+        assert_eq!(
+            links.agent_url("s1", "", "p").unwrap().as_deref(),
+            Some("https://chat/main")
+        );
+    }
     use super::*;
 
     fn write_session(dir: &Path, id: &str, workspace: &str, updated_at: &str) {

@@ -3,10 +3,13 @@
 **Run coding agents through free chat web UIs instead of paying for an API.**
 FreeChatCode is a local, OpenAI-compatible bridge: it starts a loopback-only
 relay, drives a real Chromium session through Playwright, and hands a coding
-agent (Codewhale today) a model that answers from a free chat page — DeepSeek
-Chat verified today; Gemini and other chat UIs are one config entry away.
+agent (Codewhale or OpenCode) a model that answers from a free chat page.
+DeepSeek and Gemini have been verified live. Google AI Mode has an experimental
+template; availability depends on the browser account and region.
 
-**Note: we need more contributions and testing to make this reliable at all, the current state is a mess, sub agent, attachments, only deepseek support, please, we humbly ask for your support, star us, fork the repo, open issues, PRs, spread it, open a discussion, we would really appreciate it!**
+Contributions and live testing are welcome. Provider pages change, and models
+sometimes finish with a promise instead of calling a tool; report reproducible
+failures with `freechatcode feedback --title "…" --body-file report.md`.
 
 No API key. No per-token bill. Your own signed-in browser session does the work.
 
@@ -23,18 +26,55 @@ workspace. FreeChatCode is only the transport.
 
 ![FreeChatCode driving a real DeepSeek Chat turn](assets/demo.gif)
 
-*Recorded from a live run: the wrapper opened a fresh conversation, submitted the
-prompt, and read the answer back as it streamed. Full clip:
-[`assets/demo.mp4`](assets/demo.mp4).*
+*A real Codewhale run reads two files, fixes an invoice calculation, and runs
+two tests through DeepSeek. The left pane renders timestamped harness output;
+the right pane is the actual Playwright browser recording. Both tests also
+passed an independent run. Wrapper diagnostics are omitted from the terminal
+pane. Full 32-second clip: [`assets/demo.mp4`](assets/demo.mp4). Rendering script:
+[`tools/render_demo.py`](tools/render_demo.py).*
 
 ---
+
+## Provider selection and independent conversations
+
+```bash
+freechatcode chatmodels list
+freechatcode chatmodels configure --Gemini
+freechatcode chatmodels set-default --Deepseek
+freechatcode chatmodels set-default --all
+freechatcode chatmodels drop --Gemini
+freechatcode chatmodels re-configure --Deepseek
+freechatcode launch opencode --default
+freechatcode launch codewhale --chatmodel=Gemini --make-default
+freechatcode launch opencode --opt=all
+```
+
+Configuration opens the provider page for sign-in and checks the composer before
+saving it. Defaults persist; dropping the default selects the first remaining
+provider. A normal launch exposes the selected model, while `--opt=all` exposes
+all configured models and warms their browsers.
+
+Requests can identify conversations with `x-freechatcode-session-id` and
+`x-freechatcode-agent-id`, or a `conversation` object containing `session_id` and
+`agent_id`. OpenCode's native session and parent-session headers are recognized.
+Each identity has an independent browser tab, relay history, and replay cache;
+SQLite stores its chat URL and message metadata. Tabs expire after five minutes
+idle, with at most 64 active identities per provider. Harnesses that supply no
+agent identity share the launch conversation; the bridge cannot infer subagents
+from message prose. Title-generation turns stay in the same conversation.
+
+Explicit image data URLs and file parts with local paths are uploaded through
+the provider's file input (up to 16 files / 8 MiB combined). If no input exists,
+the original attachment reference remains in the request. Remote URLs and file
+IDs are forwarded without fetching them. The harness continues to own files and
+tools. Upload completion beyond the browser input is provider dependent.
 
 ## Status
 
 **Working, and verified against the live chat page** — not just
 "compiles". Full detail in [STATUS.md](STATUS.md).
 
-- `cargo test` — **64 passing**, 0 failing, plus thirteen live end-to-end tests
+- `cargo test` — **93 passing**, 0 failing, plus 23 live tests
   that are ignored by default: `cargo test -- --ignored`.
 - **A price is always answered**: `GET /v1/models` gives every model
   `"pricing": "Unlimited Chat!"`. One honest caveat, measured rather than
@@ -348,8 +388,8 @@ toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = true 
 are the page controls engaged before a turn (and read back after). The selectors
 were read off the live page, not guessed — `reasoning` in particular, which names
 the page's own thinking block so it is never mistaken for the model's answer. Every provider runs as its own tab in
-one relay, so `--model gemini-flash` and `--model deepseek-pro` both work in the
-same session.
+one relay. Use `--opt=all` to expose all configured providers to the harness;
+the Gemini template uses the page-selected mode, advertised as `gemini`.
 
 Timeouts are knobs too, and they matter: `poll_ms` (how often the page is
 re-read) and `settle_polls` (how many identical reads mean "the reply stopped
@@ -372,7 +412,7 @@ login_wait_secs = 900
 login_probe_secs = 20      # headless sign-in probe before reopening a visible window
 response_secs = 300
 poll_ms = 150
-settle_polls = 3
+settle_polls = 20
 action_secs = 20
 navigation_secs = 20
 link_probe_secs = 10

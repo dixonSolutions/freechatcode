@@ -21,12 +21,14 @@ path = "src/install_browser.rs"
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 axum = { version = "0.8.5", features = ["json", "ws"] }
+base64 = "0.22.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
 futures-util = "0.3"
 libc = "0.2"
 playwright-rs = "0.19.0"
+quick-xml = "0.41.0"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "socks"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

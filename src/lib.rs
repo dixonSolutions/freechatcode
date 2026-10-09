@@ -42,19 +42,40 @@ use uuid::Uuid;
 /// there is no per-token bill to report. Everything the wrapper is asked about
 /// pricing returns this, so a caller never has to render "unknown".
 pub const PRICING_LABEL: &str = "Unlimited Chat!";
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
+// Allow the base64 expansion of an 8 MiB attachment plus harness metadata.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROMPT_BYTES: usize = 16 * 1024 * 1024;
 /// How often a keep-alive comment is written while the browser turn runs.
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
+pub mod attachments;
 pub mod config;
 pub mod harness;
 pub mod health;
+mod native_calls;
+pub mod providers;
 pub mod sessions;
 pub mod setup;
 
 #[async_trait]
 pub trait ChatUi: Send + Sync {
+    /// Open/reset before setting model controls; return whether send still needs a reset.
+    async fn prepare_turn(&self, start_new_chat: bool) -> Result<bool, String> {
+        Ok(start_new_chat)
+    }
+    /// Open an independent conversation, sharing authentication but not messages.
+    async fn fork(
+        self: Arc<Self>,
+        _identity: &ConversationIdentity,
+    ) -> Result<Arc<dyn ChatUi>, String> {
+        Err("this chat driver does not support independent conversations".into())
+    }
+
+    async fn close(&self) {}
+    /// Whether this driver has a saved page conversation to continue.
+    async fn resuming(&self) -> bool {
+        false
+    }
     async fn send(&self, prompt: &str, start_new_chat: bool) -> Result<String, String>;
 
     /// Like [`ChatUi::send`], but report the visible reply as it grows so the
@@ -277,10 +298,26 @@ struct ModelRoute {
     owned_by: String,
     name: Option<String>,
     toggles: Vec<config::Toggle>,
+    conversations: Arc<Mutex<std::collections::HashMap<ConversationIdentity, Conversation>>>,
+    cleanup_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationIdentity {
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+}
+
+struct Conversation {
+    ui: Arc<dyn ChatUi>,
+    relay: Arc<Mutex<ConversationRelay>>,
+    touched: std::time::Instant,
 }
 
 #[derive(Clone)]
 pub struct ServerState {
+    default_conversation: Option<ConversationIdentity>,
     token: Arc<str>,
     /// Ordered `(model_id, route)` pairs, in catalog order.
     routes: Vec<(String, ModelRoute)>,
@@ -302,6 +339,8 @@ impl ServerState {
         let mut routes = Vec::new();
         for group in groups {
             let relay = Arc::new(Mutex::new(ConversationRelay::new(group.start_fresh)));
+            let conversations = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let cleanup_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
             for model in group.models {
                 routes.push((
                     model.id,
@@ -311,12 +350,15 @@ impl ServerState {
                         owned_by: model.owned_by,
                         name: model.name,
                         toggles: model.toggles,
+                        conversations: Arc::clone(&conversations),
+                        cleanup_started: Arc::clone(&cleanup_started),
                     },
                 ));
             }
         }
         Self {
             token: token.into(),
+            default_conversation: None,
             routes,
             audit,
             turns: Arc::new(NoopTurns),
@@ -358,6 +400,12 @@ impl ServerState {
     #[must_use]
     pub fn with_turns(mut self, turns: Arc<dyn TurnSink>) -> Self {
         self.turns = turns;
+        self
+    }
+
+    #[must_use]
+    pub fn with_default_conversation(mut self, identity: ConversationIdentity) -> Self {
+        self.default_conversation = Some(identity);
         self
     }
 
@@ -445,10 +493,14 @@ async fn models(State(state): State<ServerState>, headers: HeaderMap) -> Respons
 async fn completions(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    Json(mut request): Json<CompletionRequest>,
 ) -> Response {
     if !authorized(&state, &headers) {
         return unauthorized();
+    }
+    if request.conversation.is_none() {
+        request.conversation =
+            identity_from_headers(&headers).or_else(|| state.default_conversation.clone());
     }
     if state.route(&request.model).is_none() {
         return api_error(StatusCode::BAD_REQUEST, "unknown wrapper model");
@@ -529,9 +581,8 @@ impl ContentStreamer {
     fn push(&mut self, raw: &str) -> Option<String> {
         let visible = partial_content(raw);
         if !visible.starts_with(self.emitted.as_str()) {
-            // The shape changed under us (an envelope gave way to plain text,
-            // say). Re-baseline without re-emitting what the client already has.
-            self.emitted = visible;
+            // SSE cannot retract bytes. Keep the actual sent prefix; never
+            // pretend a replacement snapshot was delivered to the client.
             return None;
         }
         if visible.len() <= self.emitted.len() {
@@ -596,10 +647,11 @@ fn streamed_completion(state: ServerState, request: CompletionRequest) -> Respon
         let outcome = loop {
             tokio::select! {
                 result = &mut turn => break result,
-                _ = ticker.tick() => {
-                    if sender.send(Ok(keepalive.clone())).await.is_err() {
-                        return;
-                    }
+                _ = ticker.tick(), if !sender.is_closed() => {
+                    // Finish and cache the browser turn even if the client leaves.
+                    // Cancelling after submit strands a generating page and makes
+                    // the next request race its unfinished reply.
+                    let _ = sender.send(Ok(keepalive.clone())).await;
                 }
             }
         };
@@ -631,6 +683,17 @@ fn streamed_completion(state: ServerState, request: CompletionRequest) -> Respon
 /// The closing chunks of a streamed turn: whatever content was not streamed
 /// live, any tool calls, the finish reason, and `[DONE]`.
 fn streamed_body(writer: &SseWriter, assistant: &Value, streamed: &str) -> String {
+    if !streamed.is_empty()
+        && !assistant
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .starts_with(streamed)
+    {
+        return sse_error(
+            "the chat page rewrote text already streamed; retry with stream=false to obtain the complete final answer",
+        );
+    }
     let finish_reason = if assistant.get("tool_calls").is_some() {
         "tool_calls"
     } else {
@@ -679,7 +742,80 @@ async fn relay_turn(
     let route = state
         .route(&request.model)
         .ok_or((StatusCode::BAD_REQUEST, "unknown wrapper model".to_owned()))?;
-    let mut relay = route.relay.lock().await;
+    let (ui, relay_lock) = if let Some(identity) = &request.conversation {
+        if !route
+            .cleanup_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let registry = Arc::downgrade(&route.conversations);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let Some(registry) = registry.upgrade() else {
+                        break;
+                    };
+                    let mut conversations = registry.lock().await;
+                    let expired: Vec<_> = conversations
+                        .iter()
+                        .filter(|(_, c)| {
+                            c.touched.elapsed() >= Duration::from_secs(300)
+                                && Arc::strong_count(&c.relay) == 1
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in expired {
+                        if let Some(c) = conversations.remove(&id) {
+                            c.ui.close().await;
+                        }
+                    }
+                }
+            });
+        }
+        let mut conversations = route.conversations.lock().await;
+        // Expire only idle conversations: an in-flight turn holds its relay lock.
+        let expired: Vec<_> = conversations
+            .iter()
+            .filter(|(_, c)| {
+                c.touched.elapsed() >= Duration::from_secs(300) && Arc::strong_count(&c.relay) == 1
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            if let Some(c) = conversations.remove(&id) {
+                c.ui.close().await;
+            }
+        }
+        if !conversations.contains_key(identity) {
+            if conversations.len() >= 64 {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "64 conversations are already active; retry after an idle conversation expires"
+                        .into(),
+                ));
+            }
+            let ui = Arc::clone(&route.ui)
+                .fork(identity)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let start_fresh = !ui.resuming().await;
+            conversations.insert(
+                identity.clone(),
+                Conversation {
+                    ui,
+                    relay: Arc::new(Mutex::new(ConversationRelay::new(start_fresh))),
+                    touched: std::time::Instant::now(),
+                },
+            );
+        }
+        let c = conversations
+            .get_mut(identity)
+            .expect("conversation inserted");
+        c.touched = std::time::Instant::now();
+        (Arc::clone(&c.ui), Arc::clone(&c.relay))
+    } else {
+        (Arc::clone(&route.ui), Arc::clone(&route.relay))
+    };
+    let mut relay = relay_lock.lock().await;
     if let Some(assistant) = relay.replay(request) {
         return Ok(assistant);
     }
@@ -701,6 +837,7 @@ async fn relay_turn(
             "kind": "input",
             "request_id": request_id.clone(),
             "model": request.model.clone(),
+            "conversation": request.conversation,
             "codewhale_messages": request.messages.clone(),
             "tools": request.tools.clone(),
             "browser_prompt": prompt.clone(),
@@ -712,14 +849,18 @@ async fn relay_turn(
     // The model that answers is decided by the page's own state (a reasoning
     // chip, a dropdown), set before the turn starts. A wrapper that cannot set
     // it fails the turn instead of answering as the wrong model.
-    if let Err(error) = route.ui.set_model_state(&route.toggles).await {
+    let reset = ui
+        .prepare_turn(reset)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    if let Err(error) = ui.set_model_state(&route.toggles).await {
         state.record_failure(Failure::request(error.clone())).await;
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     let raw = match match snapshots {
-        Some(snapshots) => route.ui.send_streaming(&prompt, reset, snapshots).await,
-        None => route.ui.send(&prompt, reset).await,
+        Some(snapshots) => ui.send_streaming(&prompt, reset, snapshots).await,
+        None => ui.send(&prompt, reset).await,
     } {
         Ok(raw) => raw,
         Err(error) => {
@@ -727,7 +868,7 @@ async fn relay_turn(
             eprintln!("freechatcode: browser relay failed: {error}");
             // Ask the transport what actually happened before blaming anyone: a
             // dead uplink is not the chat service's fault.
-            let failure = match route.ui.diagnose(&error).await {
+            let failure = match ui.diagnose(&error).await {
                 Some(failure) => failure,
                 None => Failure::unknown(error.clone()),
             };
@@ -744,7 +885,8 @@ async fn relay_turn(
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "DeepSeek Chat UI did not return a complete response ({error}); {} before retrying",
+                    "{} Chat UI did not return a complete response ({error}); {} before retrying",
+                    route.owned_by,
                     match failure.blame.as_str() {
                         "network" => "this looks like DNS or connectivity, not the service",
                         "service" => "the service itself answered badly",
@@ -755,12 +897,18 @@ async fn relay_turn(
             ));
         }
     };
-    let assistant = relay
-        .finish(request, raw.clone(), &state.options)
-        .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+    let assistant = match relay.finish(request, raw.clone(), &state.options) {
+        Ok(assistant) => assistant,
+        Err(message) => {
+            state
+                .record_failure(Failure::request(message.clone()))
+                .await;
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+    };
     // Which model the page used is not an API fact; record what the UI showed so
     // a conversation can be attributed model-by-model after the fact.
-    let model_label = route.ui.model_label().await;
+    let model_label = ui.model_label().await;
     let turn = TurnRecord {
         provider_id: Some(route.owned_by.clone()),
         model_label: model_label.clone(),
@@ -788,6 +936,11 @@ async fn relay_turn(
         }))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if let Some(identity) = &request.conversation
+        && let Some(conversation) = route.conversations.lock().await.get_mut(identity)
+    {
+        conversation.touched = std::time::Instant::now();
+    }
     Ok(assistant)
 }
 
@@ -870,6 +1023,9 @@ pub struct CompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Explicit identity supplied by a harness adapter or direct API caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationIdentity>,
 }
 
 #[derive(Default)]
@@ -913,12 +1069,11 @@ impl ConversationRelay {
         let reset = if first_turn {
             self.start_fresh
         } else {
-            self.head.as_deref() != Some(head.as_str())
+            request.conversation.is_none() && self.head.as_deref() != Some(head.as_str())
         };
-        // The first turn of a run always feeds the entire transcript so the
-        // browser conversation is aligned with the Codewhale session, whatever
-        // state it was left in.
-        let full_context = first_turn || reset;
+        // New pages need the harness context. Linked pages already hold it and
+        // receive only the new tail rather than a duplicated transcript.
+        let full_context = reset || (first_turn && self.start_fresh);
         // On continuation, send only what Codewhale added after its last
         // assistant message (the tool results, or the next user turn) instead of
         // replaying the whole transcript.
@@ -941,9 +1096,7 @@ impl ConversationRelay {
             .then_some(request.tools.as_ref())
             .flatten()
             .map(|tools| options.tools.forwarded(tools));
-        let tool_choice = include_tools
-            .then_some(request.tool_choice.as_ref())
-            .flatten();
+        let tool_choice = request.tool_choice.as_ref();
         let payload = json!({
             "messages": delta,
             "tools": tools,
@@ -953,7 +1106,7 @@ impl ConversationRelay {
         // The prompt *is* the request: no preamble, no reminder, no contract.
         let prompt = payload;
         if prompt.len() > MAX_PROMPT_BYTES {
-            return Err("browser prompt exceeds the 4 MiB relay limit".into());
+            return Err("browser prompt exceeds the 16 MiB relay limit".into());
         }
         Ok((prompt, reset))
     }
@@ -1005,7 +1158,37 @@ fn request_signature(request: &CompletionRequest) -> Result<String, String> {
     .map_err(|error| format!("could not fingerprint chat request: {error}"))
 }
 
+fn identity_from_headers(headers: &HeaderMap) -> Option<ConversationIdentity> {
+    let read = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+    };
+    let session = read(&[
+        "x-freechatcode-session-id",
+        "x-opencode-session-id",
+        "x-session-id",
+    ])?;
+    let parent = read(&["x-opencode-parent-session-id", "x-parent-session-id"]);
+    Some(ConversationIdentity {
+        session_id: parent.unwrap_or(session).to_owned(),
+        agent_id: read(&["x-freechatcode-agent-id"])
+            .or_else(|| parent.map(|_| session))
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
 fn validate_request(request: &CompletionRequest) -> Result<(), String> {
+    if let Some(identity) = &request.conversation
+        && (identity.session_id.is_empty()
+            || identity.session_id.len() > 256
+            || identity.agent_id.len() > 256)
+    {
+        return Err(
+            "conversation identity needs a nonempty session ID and IDs of at most 256 bytes".into(),
+        );
+    }
     if request.messages.is_empty() {
         return Err("chat request must contain at least one message".into());
     }
@@ -1133,12 +1316,31 @@ fn unescape_json_string(text: &str) -> String {
 }
 
 fn partial_content(raw: &str) -> String {
+    if let Some(prefix) = native_calls::visible_prefix(raw) {
+        return prefix.to_owned();
+    }
     let trimmed = raw.trim_start();
     let trimmed = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .map_or(trimmed, str::trim_start);
     if !trimmed.starts_with('{') {
+        // A trailing JSON call may follow prose. Hold an unfinished object
+        // until its shape is known so its syntax cannot leak into SSE before
+        // the final parser recognizes it as a tool call. Ordinary JSON is
+        // released unchanged once complete (or with the final answer).
+        for (index, _) in raw.match_indices('{') {
+            let candidate = &raw[index..];
+            let Some(end) = balanced_object_end(candidate) else {
+                return raw[..index].to_owned();
+            };
+            if serde_json::from_str::<Value>(&candidate[..end])
+                .ok()
+                .is_some_and(|value| value.get("tool_calls").is_some_and(Value::is_array))
+            {
+                return raw[..index].to_owned();
+            }
+        }
         return trimmed.to_owned();
     }
     // A tool-call envelope is JSON for the relay, never text for the user. Only
@@ -1229,6 +1431,13 @@ fn parse_assistant_message(
     tools: Option<&[Value]>,
     policy: &ToolPolicy,
 ) -> Result<Value, String> {
+    if let Some((envelope, prose)) = native_calls::extract(raw)? {
+        let mut message = parse_assistant_message(&envelope.to_string(), tools, policy)?;
+        if !prose.trim().is_empty() {
+            message["content"] = Value::String(prose);
+        }
+        return Ok(message);
+    }
     let cleaned = raw.trim();
     let cleaned = cleaned
         .strip_prefix("```json")
@@ -1244,11 +1453,10 @@ fn parse_assistant_message(
         // Not envelope-only, but it may still *contain* one, written after the
         // model's reasoning. A call the model did make must not be thrown away
         // and printed as text: the tool never runs and the turn looks stalled.
-        if let Some((envelope, prose)) = extract_tool_call_envelope(cleaned) {
+        if let Some((envelope, prose)) = extract_tool_call_envelope(raw) {
             let mut message = parse_assistant_message(&envelope.to_string(), tools, policy)?;
             if message.get("tool_calls").is_some() {
-                let prose = prose.trim();
-                if !prose.is_empty() {
+                if !prose.trim().is_empty() {
                     message["content"] = Value::String(prose.to_owned());
                 }
                 return Ok(message);
@@ -1323,6 +1531,80 @@ fn parse_assistant_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_harness_headers_distinguish_parent_and_child_sessions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-opencode-session-id", HeaderValue::from_static("child"));
+        headers.insert(
+            "x-opencode-parent-session-id",
+            HeaderValue::from_static("parent"),
+        );
+        assert_eq!(
+            identity_from_headers(&headers),
+            Some(ConversationIdentity {
+                session_id: "parent".into(),
+                agent_id: "child".into()
+            })
+        );
+    }
+
+    struct IndependentUi {
+        name: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ChatUi for IndependentUi {
+        async fn fork(
+            self: Arc<Self>,
+            id: &ConversationIdentity,
+        ) -> Result<Arc<dyn ChatUi>, String> {
+            Ok(Arc::new(Self {
+                name: format!("{}/{}", id.session_id, id.agent_id),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+        async fn send(&self, _: &str, _: bool) -> Result<String, String> {
+            Ok(format!(
+                "{}:{}",
+                self.name,
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn parallel_agents_do_not_share_replies_or_replay_caches() {
+        let state = ServerState::new(
+            "secret",
+            Arc::new(IndependentUi {
+                name: "root".into(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(FakeAudit),
+        );
+        let mut a = request(vec![json!({"role":"user","content":"same input"})], false);
+        a.conversation = Some(ConversationIdentity {
+            session_id: "s".into(),
+            agent_id: "a".into(),
+        });
+        let mut b = a.clone();
+        b.conversation.as_mut().unwrap().agent_id = "b".into();
+        let (one, two) = tokio::join!(relay_turn(&state, &a, None), relay_turn(&state, &b, None));
+        assert_eq!(one.unwrap()["content"], "s/a:0");
+        assert_eq!(two.unwrap()["content"], "s/b:0");
+        assert_eq!(
+            relay_turn(&state, &a, None).await.unwrap()["content"],
+            "s/a:0"
+        );
+        a.messages[0]["content"] = json!("new input");
+        assert_eq!(
+            relay_turn(&state, &a, None).await.unwrap()["content"],
+            "s/a:1"
+        );
+        assert_eq!(
+            relay_turn(&state, &b, None).await.unwrap()["content"],
+            "s/b:0"
+        );
+    }
     use std::sync::Mutex as StdMutex;
 
     use super::*;
@@ -1433,6 +1715,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: None,
+                conversation: None,
             })
             .is_ok()
         );
@@ -1496,6 +1779,7 @@ mod tests {
             tools: Some(tools.clone()),
             tool_choice: None,
             stream: None,
+            conversation: None,
         };
         let (prompt, reset) = relay.prepare(&first, &options).expect("prepare first");
         assert!(reset, "a fresh session must open a new platform chat");
@@ -1521,6 +1805,7 @@ mod tests {
             tools: Some(tools.clone()),
             tool_choice: None,
             stream: None,
+            conversation: None,
         };
         let (prompt, reset) = relay
             .prepare(&continuation, &options)
@@ -1537,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn first_turn_of_a_resumed_run_feeds_the_whole_transcript_without_a_new_chat() {
+    fn resumed_chat_receives_only_new_messages_without_replaying_history() {
         let options = BridgeOptions::default();
         let relay = ConversationRelay::new(false); // resuming a linked chat
 
@@ -1553,12 +1838,13 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            conversation: None,
         };
         let (prompt, reset) = relay.prepare(&resumed, &options).expect("prepare");
         assert!(!reset, "a resumed link must not open a new chat");
         assert!(
-            prompt.contains("EARLIER-TURN"),
-            "the browser must be caught up with the whole transcript"
+            !prompt.contains("EARLIER-TURN") && !prompt.contains("EARLIER-ANSWER"),
+            "the linked page already holds the earlier transcript"
         );
         assert!(prompt.contains("NEW-TURN"));
     }
@@ -1725,6 +2011,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            conversation: None,
         };
         let (prompt, _) = relay
             .prepare(&request, &BridgeOptions::default())
@@ -1817,6 +2104,46 @@ mod tests {
             partial_content(r#"{"type":"final","content":"I will use tool_calls now"}"#),
             "I will use tool_calls now"
         );
+    }
+
+    #[test]
+    fn native_calls_after_streamed_prose_preserve_whitespace() {
+        let prose = "I'll read both files first.\n\n";
+        let raw = format!(
+            "{prose}<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read\"><｜｜DSML｜｜ parameter name=\"path\" string=\"true\">invoice.py</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>"
+        );
+        let mut streamer = ContentStreamer::default();
+        let mut delivered = String::new();
+        for (index, _) in raw.char_indices().skip(1) {
+            if let Some(delta) = streamer.push(&raw[..index]) {
+                delivered.push_str(&delta);
+            }
+        }
+        assert_eq!(delivered, prose);
+        let message = parse_assistant_message(&raw, None, &ToolPolicy::default()).unwrap();
+        assert_eq!(message["content"], delivered);
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn json_calls_after_prose_do_not_leak_or_rewrite_streamed_bytes() {
+        let prose = "Reading the file.\n\n";
+        let raw = format!(
+            "{prose}{}",
+            json!({"type":"tool_calls","tool_calls":[{"function":{"name":"read","arguments":{"path":"invoice.py"}}}]})
+        );
+        let mut streamer = ContentStreamer::default();
+        let mut delivered = String::new();
+        for (index, _) in raw.char_indices().skip(1) {
+            if let Some(delta) = streamer.push(&raw[..index]) {
+                delivered.push_str(&delta);
+            }
+        }
+        assert_eq!(delivered, prose);
+        let message = parse_assistant_message(&raw, None, &ToolPolicy::default()).unwrap();
+        assert_eq!(message["content"], delivered);
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(partial_content("Example: {\"x\":1}"), "Example: {\"x\":1}");
     }
 
     #[test]
@@ -2142,6 +2469,7 @@ mod tests {
             })]),
             tool_choice: None,
             stream: Some(stream),
+            conversation: None,
         }
     }
 

@@ -63,11 +63,14 @@ assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistan
 # The answer body is `.ds-assistant-message-main-content`. Set to "" for a page
 # that renders no reasoning.
 reasoning = ".ds-think-content"
-send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
+send = ".ds-button--primary.ds-button--circle, button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
 new_chat = "button[aria-label*='new chat' i], button[title*='new chat' i], [data-testid*='new-chat']"
 search_toggle = "div.ds-toggle-button:has-text('Search')"
 thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
-file_upload = "input[type='file'], button[aria-label*='upload' i], button[aria-label*='attach' i], [data-testid*='upload' i]"
+file_upload = "input[type='file']"
+rename_menu = "a[href={chat_path}] [role='button']"
+rename_action = 'text="Rename"'
+rename_input = "input.ds-input__input"
 # The chat page's own mode chips ("DeepThink", "Search"). Their text names the
 # mode and their `--selected` class says whether it is on, which is how a turn
 # is attributed to a model. Verified against chat.deepseek.com; set to "" to
