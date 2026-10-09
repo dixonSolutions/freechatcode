@@ -4,7 +4,7 @@
 API.** DeepChatCode is a local, OpenAI-compatible bridge: it starts a
 loopback-only relay, drives a real Chromium session through Playwright, and
 hands Codewhale a `deepseek-chat` model that answers from the chat page.
-
+**Note: we need more contributions and testing to make this reliable at all, the current state is a mess, sub agent, attachments, only deepseek support, please, we humbly ask for your support, star us, fork the repo, open issues, PRs, spread it, open a discussion, we would really appreciate it!**
 No API key. No per-token bill. Your own signed-in browser session does the work.
 
 ```
