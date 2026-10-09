@@ -2469,6 +2469,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_providers_are_advertised_and_served_apart() {
+        install_crypto_provider();
+        let state = ServerState::with_routes(
+            "secret",
+            vec![
+                RouteGroup {
+                    ui: Arc::new(FakeUi {
+                        replies: StdMutex::new(vec!["ok".to_owned()]),
+                        prompts: StdMutex::new(Vec::new()),
+                    }),
+                    start_fresh: false,
+                    models: vec![ModelSpec {
+                        id: "deepseek-chat".into(),
+                        owned_by: "deepseek".into(),
+                        name: Some("DeepSeek Chat".into()),
+                        toggles: vec![],
+                    }],
+                },
+                RouteGroup {
+                    ui: Arc::new(FakeUi {
+                        replies: StdMutex::new(vec!["ok".to_owned()]),
+                        prompts: StdMutex::new(Vec::new()),
+                    }),
+                    start_fresh: false,
+                    models: vec![ModelSpec {
+                        id: "gemini-flash".into(),
+                        owned_by: "gemini".into(),
+                        name: Some("Gemini Flash".into()),
+                        toggles: vec![],
+                    }],
+                },
+            ],
+            Arc::new(FakeAudit),
+            BridgeOptions::default(),
+        );
+        let address = serve(state).await;
+
+        // The catalog lists both providers' models, each owned by its provider.
+        let catalog: Value = reqwest::Client::new()
+            .get(format!("http://{address}/v1/models"))
+            .bearer_auth("secret")
+            .send()
+            .await
+            .expect("models response")
+            .json()
+            .await
+            .expect("models json");
+        let entries = catalog["data"].as_array().expect("a model list");
+        let owned_by = |id: &str| -> String {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .and_then(|entry| entry["owned_by"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+        assert_eq!(owned_by("deepseek-chat"), "deepseek");
+        assert_eq!(owned_by("gemini-flash"), "gemini");
+
+        // Both are served and reported under the model the caller asked for.
+        for model in ["deepseek-chat", "gemini-flash"] {
+            let mut req = request(vec![json!({"role":"user","content":"hi"})], false);
+            req.model = model.to_owned();
+            let response = post(address, "secret", &req, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{model} must be served");
+            let body: Value = response.json().await.expect("completion json");
+            assert_eq!(
+                body["model"], model,
+                "{model} must be reported, not assumed"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn loopback_api_requires_token_and_never_advertises_cors() {
         install_crypto_provider();
         let state = ServerState::new(
