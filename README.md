@@ -1,578 +1,202 @@
-# FreeChatCode 👛
+# FreeChatCode 🌉
 
-**Run coding agents through free chat web UIs instead of paying for an API.**
-FreeChatCode is a local, OpenAI-compatible bridge: it starts a loopback-only
-relay, drives a real Chromium session through Playwright, and hands a coding
-agent (Codewhale or OpenCode) a model that answers from a free chat page.
-DeepSeek and Gemini have been verified live. Google AI Mode has an experimental
-template; availability depends on the browser account and region.
+Run a coding harness through your signed-in chat browser. FreeChatCode connects
+Codewhale, OpenCode, or OpenClaw to a local OpenAI-compatible relay, then drives
+the provider's web UI with Playwright. The harness runs tools in your workspace;
+the browser supplies model replies.
 
-Contributions and live testing are welcome. Provider pages change, and models
-sometimes finish with a promise instead of calling a tool; report reproducible
-failures with `freechatcode feedback --title "…" --body-file report.md`.
-
-No API key. No per-token bill. Your own signed-in browser session does the work.
-
-```
-Codewhale (subprocess)
-    ↓  OpenAI-compatible API, 127.0.0.1, random bearer token
-FreeChatCode relay
-    ↓  Playwright, incremental reads of the visible page
-DeepSeek Chat (Chromium)
+```text
+Codewhale / OpenCode / OpenClaw
+              ↓
+   authenticated loopback relay
+              ↓
+     signed-in Chromium chat
 ```
 
-Codewhale still owns the turn loop, tools, permissions, approvals, and
-workspace. FreeChatCode is only the transport.
+You use your own chat account. Its subscription, usage limits, and availability
+still apply. No provider API key is required for the browser transport.
 
-![FreeChatCode driving a real DeepSeek Chat turn](assets/demo.gif)
+## Get started
 
-*A real Codewhale run reads two files, fixes an invoice calculation, and runs
-two tests through DeepSeek. The left pane renders timestamped harness output;
-the right pane is the actual Playwright browser recording. Both tests also
-passed an independent run. Wrapper diagnostics are omitted from the terminal
-pane. Full 32-second clip: [`assets/demo.mp4`](assets/demo.mp4). Rendering script:
-[`tools/render_demo.py`](tools/render_demo.py).*
+```bash
+cargo install --git https://github.com/dixonSolutions/freechatcode --locked
+freechatcode install                  # install Codewhale if needed
+freechatcode                         # visible browser and Codewhale
+```
 
----
+Sign in directly in the browser when prompted. Playwright's matching Chromium
+is downloaded automatically if missing. To install the browser beforehand:
 
-## Provider selection and independent conversations
+```bash
+cargo run --bin freechatcode-install-browser
+```
+
+Run from the directory where the harness should work. Pass harness arguments
+after `--`:
+
+```bash
+freechatcode launch codewhale -- --help
+freechatcode launch opencode -- run "Inspect this project and run its tests"
+freechatcode launch openclaw -- --json "Inspect this project and run its tests"
+```
+
+OpenCode and official OpenClaw must already be installed. The Cargo package
+`openclaw-cli` 0.1.0 is a community gateway CLI without an `agent` command; it
+cannot run this coding adapter. Use [official OpenClaw](https://docs.openclaw.ai/install).
+
+## Demos
+
+![A real coding run through the browser relay](assets/demo.gif)
+
+[Watch the full OpenCode + DeepSeek demo](assets/demo.mp4): normalize whitespace,
+edit Python, and pass four tests. The terminal pane contains timestamped
+output from the real harness; the browser pane records the actual chat page.
+The fixture starts with failing tests and is checked independently after the
+harness exits. The publishing script refuses failed runs by default.
+
+[Record another example](tools/record_demo.py) and
+[render the capture](tools/render_demo.py):
+
+```bash
+cargo build --locked
+python3 tools/record_demo.py --harness opencode --provider deepseek --scenario slug
+python3 tools/render_demo.py /path/printed/by/recorder/capture.json
+```
+
+| More examples | Scenario | Independent result |
+| --- | --- | --- |
+| [OpenCode + Gemini](assets/demo-gemini.mp4) | Invoice fix with the explicit compact agent | 2 tests pass |
+| [Official OpenClaw + DeepSeek](assets/demo-openclaw.mp4) | Read, edit, execute | 2 tests pass |
+| [OpenClaw whitespace scenario](assets/demo-openclaw-whitespace.mp4) | Trim, repeated spaces, tabs, empty input | 4 tests pass |
+| [OpenCode + Google AI Mode response](assets/demo-google-ai-mode-response.mp4) | Small request with tools disabled | Exact response check passes |
+| [Google AI Mode diagnostic](assets/demo-google-ai-mode-diagnostic.mp4) | Explicitly failed coding run | No tool call; 2 tests still fail |
+
+Gemini's compact agent is an OpenCode project configuration, selected with
+`--compact-agent` in the recorder. It permits bash only and explains the tool
+reply shape in the harness's own prompt. The bridge adds no instructions.
+See [OpenCode's agent configuration](https://opencode.ai/docs/agents/).
+
+## Providers and harnesses
+
+| Provider | Browser responses | Coding tools |
+| --- | --- | --- |
+| DeepSeek | Verified with a signed-in account | Real file edits and passing tests with all three harnesses |
+| Gemini | Verified with a signed-in native browser | OpenCode compact-agent invoice scenario passed; default agents in all three harnesses returned prose |
+| Google AI Mode | Verified through OpenCode with a small agent | Coding remains experimental; search fallbacks and context limits affect requests |
+
+Provider model IDs describe page state. Gemini uses the model selected in its
+web UI. DeepSeek exposes `deepseek-chat` and `deepseek-pro`; the latter engages
+DeepThink. Provider web pages can change independently of this project.
 
 ```bash
 freechatcode chatmodels list
 freechatcode chatmodels configure --Gemini
+freechatcode chatmodels configure --GoogleAIMode
 freechatcode chatmodels set-default --Deepseek
-freechatcode chatmodels set-default --all
-freechatcode chatmodels drop --Gemini
-freechatcode chatmodels re-configure --Deepseek
-freechatcode launch opencode --default
-freechatcode launch codewhale --chatmodel=Gemini --make-default
+freechatcode launch opencode --chatmodel=Gemini
 freechatcode launch opencode --opt=all
 ```
 
-Configuration opens the provider page for sign-in and checks the composer before
-saving it. Defaults persist; dropping the default selects the first remaining
-provider. A normal launch exposes the selected model, while `--opt=all` exposes
-all configured models and warms their browsers.
+Configuration checks the composer before saving the provider. That confirms
+browser readiness; successful tool execution needs a live harness test.
+Defaults persist. `--opt=all` exposes all configured models and warms their
+browsers. See [configuration](docs/configuration.md) for selectors and model
+settings.
 
-Requests can identify conversations with `x-freechatcode-session-id` and
-`x-freechatcode-agent-id`, or a `conversation` object containing `session_id` and
-`agent_id`. OpenCode's native session and parent-session headers are recognized.
-Each identity has an independent browser tab, relay history, and replay cache;
-SQLite stores its chat URL and message metadata. Tabs expire after five minutes
-idle, with at most 64 active identities per provider. Harnesses that supply no
-agent identity share the launch conversation; the bridge cannot infer subagents
-from message prose. Title-generation turns stay in the same conversation.
+## Browser and authentication
 
-Explicit image data URLs and file parts with local paths are uploaded through
-the provider's file input (up to 16 files / 8 MiB combined). If no input exists,
-the original attachment reference remains in the request. Remote URLs and file
-IDs are forwarded without fetching them. The harness continues to own files and
-tools. Upload completion beyond the browser input is provider dependent.
-
-## Status
-
-**Working, and verified against the live chat page** — not just
-"compiles". Full detail in [STATUS.md](STATUS.md).
-
-- `cargo test` — **93 passing**, 0 failing, plus 23 live tests
-  that are ignored by default: `cargo test -- --ignored`.
-- **A price is always answered**: `GET /v1/models` gives every model
-  `"pricing": "Unlimited Chat!"`. One honest caveat, measured rather than
-  guessed: *Codewhale's* footer says `cost: unknown (billing basis unknown)` for
-  this route, and nothing the wrapper returns changes that — five shapes of
-  catalog response were tried against real Codewhale, including a pricing string,
-  per-million numbers and an OpenRouter-style object. Codewhale decides it from
-  its own catalog. See [STATUS.md](STATUS.md).
-- **The whole pipeline was run for real**: `freechatcode -- exec "…"` launched
-  `codewhale 0.10.0`, which answered through the local relay and the live chat
-  page and printed `PONG`, exit 0.
-- A live turn against `chat.deepseek.com`: first streamed chunk at **~0.9 s**,
-  whole turn in **~1.4 s**.
-- Tool calls verified live both ways: a declared catalog reaches the model
-  (12 tools, 34 KB prompt) and can be suppressed (0 tools, 1.2 KB prompt), and a
-  real `tool_calls` round trip returns a final answer.
-- **Long conversations keep answering.** The chat page unmounts messages that
-  scroll out of view, so counting assistant elements is not a truth about new
-  replies — past a few exchanges the count stops growing while replies keep
-  arriving, and the old count-based detection called the page silent. It reads
-  the newest reply instead: verified live six prompts deep in one conversation
-  (`W1`…`W6`, ~1.9 s each, the mounted count standing still on the last three).
-- **Resume verified live**: a second browser opened on the linked conversation,
-  recognised it, and answered a follow-up **in the same conversation**.
-- Attach mode verified live against a Chromium the wrapper did not start.
-- Incremental streaming, tool-call forwarding, session resume, model
-  attribution, local OCR/vision, and desktop remote control are each verified
-  with the evidence recorded in STATUS.md.
-
-Known limits are listed honestly in [STATUS.md](STATUS.md) — the chat UI is not
-an API contract, and model identity is what the page displays, not an API fact.
-
-**The design is one decision:** Codewhale owns the loop and the tools, the chat
-page owns the conversation, and this wrapper is only a model endpoint — messages
-in, text out. Read [docs/design.md](docs/design.md) before changing anything about
-what the wrapper does or does not do to a reply.
-
-## What it can do
-
-- **Own TUI** — a pre-flight lobby showing codewhale binary, version, relay, and
-  browser health (`freechatcode tui`).
-- **Real browser, real session** — launches a dedicated Chromium profile, or
-  attaches to a browser you already have open over CDP.
-- **Headless or visible** — runs headless by default and reopens a visible
-  window automatically when sign-in is needed.
-- **Starts immediately** — Codewhale is launched while the browser is still warming,
-  so the terminal is yours at once instead of after the page loads; the browser
-  reports itself ready (`browser ready in Ns`) off the critical path. Navigation
-  waits for the DOM rather than every image and beacon, which roughly halved the
-  wait: **1.8-2.2 s** headless, 5.5 s visible.
-- **Resume, don't restart** — maps each Codewhale session to its DeepSeek
-  conversation and navigates back to it instead of re-feeding the transcript.
-- **Survives the browser dying** — the page and its context are watched, so a
-  closed or crashed browser is reopened **on the same conversation**: by a watcher
-  while the bridge is idle, and by a one-shot retry if it happens mid-turn.
-- **Incremental streaming** — reads the visible reply as it grows and emits
-  OpenAI `delta` chunks; output appears as it is written, not all at once.
-- **Tool calls both ways** — the tool catalog goes into the chat, tool calls come
-  back as OpenAI `tool_calls`, and tool results go back in.
-- **A log that says whose fault it was** — every turn is recorded, failures
-  included, with a diagnosis that separates a dead DNS or uplink from a service
-  that answered badly: `freechatcode turns`.
-- **Model attribution** — every turn is logged with the mode the page showed
-  (for example `DeepThink=on, Search=on`), so a chat can be explained after the
-  fact: `freechatcode turns`.
-- **Search, DeepThink, temperature, max tokens** — the page's own mode chips are
-  read every turn and recorded (`DeepThink=on, Search=off`), and the **DeepThink
-  control is driven**, not just read: asking the relay for `deepseek-pro`
-  engages it, and the next `deepseek-chat` turn puts it back. Verified live — the
-  chips read `off → on → on through a real turn → off`.
-- **Configured models** — `/v1/models` advertises every model in your
-  `[[providers]]` config (the default DeepSeek provider ships `deepseek-chat` and
-  `deepseek-pro`, both served by one tab); `--model deepseek-pro` launches the
-  harness on the reasoning one. A pro turn that cannot engage DeepThink fails
-  rather than answering as the plain model.
-- **A price that is never "unknown"** — asked what a model costs, the wrapper
-  answers `Unlimited Chat!`, always a non-empty string. What *Codewhale's own
-  footer* prints is a separate matter; see the note under [Status](#status).
-- **Two run modes** — `show` watches the work in a visible window; `silent` runs
-  headless and quiet. Sign-in reopens a window in both.
-- **Images and files** — uploaded through the visible browser's file input.
-- **GUI or direct API** — drive the chat page, or POST to the site's own
-  completion endpoint from inside the page so the session cookies apply.
-- **Local vision and OCR** — `tools/vision.py` and `tools/ocr.py` run fully
-  offline against a local model (and tesseract for exact OCR).
-- **Remote desktop** — GNOME Remote Desktop set up and verified; see
-  [docs/remote-desktop.md](docs/remote-desktop.md).
-
-## Install
-
-```bash
-cargo install --git https://github.com/dixonSolutions/freechatcode
-```
-
-Not on crates.io yet, so this git install is the one that works today. Or from
-source:
-
-```bash
-cargo build --release
-cargo run                 # bare `cargo run` starts the bridge (default-run)
-cargo run --release       # same, optimised
-```
-
-**There is no separate browser step.** On the first run the wrapper checks for
-Playwright's Chromium, and if it is missing it fetches the build matching the
-driver pinned in `Cargo.lock` and carries on — about 115 MB, once. The browser
-lands in `~/.cache/ms-playwright` (or `$PLAYWRIGHT_BROWSERS_PATH`), which a
-distrobox shares with the host, so it is usually already there.
-
-If you would rather pay that download at build time — a Dockerfile or a CI image
-— the same installer is a binary. It never needs a `playwright` CLI on `PATH`:
-
-```bash
-cargo run --bin freechatcode-install-browser
-cargo run --bin freechatcode-install-browser -- --with-deps   # minimal image; uses sudo
-```
-
-### The browser installs itself
-
-A first run on a fresh machine finds the driver (downloaded at build time by the
-crate's own build script) but not the browser. Rather than stopping, the wrapper
-fetches the matching Chromium and retries:
-
-```
-freechatcode: Playwright's Chromium is not installed yet; fetching it now
-              (one time, ~150 MB). Set PLAYWRIGHT_BROWSERS_PATH to put it elsewhere.
-Chrome Headless Shell 153.0.8010.12 (playwright chromium-headless-shell v1243)
-              downloaded to ~/.cache/ms-playwright/chromium_headless_shell-1243
-… PONG
-```
-
-Driver and browser always match, because both come from the same crate version.
-
-## Quickstart
-
-1. **Install Codewhale** if it is not already there:
-
-   ```bash
-   freechatcode install
-   ```
-
-2. **Run the bridge** (add `--` to pass anything through to Codewhale):
-
-   ```bash
-   freechatcode
-   ```
-
-3. **Sign in** in the browser window if you are asked to. Then just use
-   Codewhale — every completion is relayed through the chat page.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `freechatcode` | Run the bridge (default) |
-| `freechatcode tui` | Pre-flight TUI (health), then the bridge |
-| `freechatcode launch [BINARY]` | Find and remember the codewhale binary, then run |
-| `freechatcode health` | Check the codewhale binary, relay, browser, auth |
-| `freechatcode turns [--limit N]` | The recorded turn log: which model answered what |
-| `freechatcode install` | Install `codewhale-cli` via cargo |
-
-Useful flags: `--mode show|silent`, `--model <model-id>` (any configured model),
-`--chat-url`, `--profile-dir`, `--cdp-endpoint`, `--record-video <DIR>`,
-`--record-video-size WxH` (`--record-video` records the page the wrapper drives —
-never your desktop).
-
-`launch` does not skip setup: it discovers the codewhale executable (a bare name
-is looked up on `PATH`, a path is used directly), writes the resolved path to
-your user config, and then starts the bridge. A binary pinned with
-`--codewhale-bin` / `$CODEWHALE_BINARY` is not rewritten into the config.
-
-### Where the wrapper's own logs go
-
-The bridge hands the terminal to the harness at 0.00s and keeps writing its own
-diagnostics — `browser ready in 1.8s` as the page warms, `reply settled after N
-polls` at the end of every turn, the browser's notes in between. Once the
-harness' TUI owns the alternate screen there is no cursor to share, so those
-lines land wherever the TUI last drew. They are therefore written to
-`~/.codewhale/freechatcode/freechatcode.log` (owner-only) from the moment the
-screen is handed over, and the screen belongs to the harness alone.
-
-The wrapper prints the path on the way in and again when the harness exits. When
-stdout is not a terminal, nothing is sharing a screen and the lines stay on
-`stderr` as before, so a script that captured them is unaffected.
-
-## Configuration
-
-Two layers, merged lowest-precedence first:
-
-- **Compiled-in defaults** — `assets/config.default.toml`, embedded in the
-  binary with `include_str!`. Ships with the package; not read at runtime.
-- **User config** — `~/.codewhale/freechatcode/config.toml` (honors
-  `$CODEWHALE_HOME`).
-
-Resolution order for any value: **CLI flag → environment → user config →
-compiled-in default**. So the codewhale path belongs in your user config
-(`[codewhale] binary = …`), not in the repository.
-
-### Bundle this in a mode
+The default `show` mode opens a visible browser. `silent` runs headless; its
+API attempt falls back to the page when the provider refuses it. For headless
+browser transport without that attempt, use:
 
 ```toml
-mode = "show"            # "show" = visible browser, prompts driven through the page
-                        # "silent" = headless browser, prompts sent to the API directly
-```
-
-A mode is a **preset** over the two knobs below, applied under your own config:
-`show` sets `[browser] headless = false` with `[transport] mode = "gui"`, and
-`silent` sets `headless = true` with `transport.mode = "api"`. Setting either
-knob yourself still wins — the one you leave alone follows the mode.
-
-`silent` asks the site's own completion endpoint first, and that endpoint refuses
-this project's requests (it wants a per-request proof-of-work header; see
-[Checks](#checks) and `STATUS.md`). So when it refuses, the turn is retried
-through the headless page and one line on stderr says so. The mode stays quiet
-either way.
-
-Sign-in is the one thing no mode suppresses: when the composer is not there, the
-browser is reopened **visibly** in both modes so you can authenticate, and the run
-continues afterwards. `--mode show|silent` overrides the config file.
-
-### Browser
-
-```toml
-[browser]
-mode = "managed"        # "managed" (own profile) or "attach" (your browser, over CDP)
-headless = true         # false = always visible; true reopens a window if sign-in is needed
-keep_alive = true       # false = close the browser after every turn
-# profile_dir = "/home/you/.codewhale/providers/deepseek/browser"
-# cdp_endpoint = "http://127.0.0.1:9222"
-# record_video_dir = "/home/you/.codewhale/freechatcode/video"
-# record_video_size = "1280x800"
-```
-
-`attach` reuses a browser you started yourself
-(`chromium --remote-debugging-port=9222`) — the same signed-in session, no
-separate profile. Passing `--cdp-endpoint` (or setting `cdp_endpoint`) implies
-attach; you do not also need `mode = "attach"`. In `managed` mode the wrapper
-refuses to fight another Chromium for the profile and says so in one line
-instead of dumping a stack trace.
-
-### Transport
-
-```toml
+mode = "silent"
 [transport]
-mode = "gui"            # "gui" drives the chat page; "api" POSTs from inside it
-
-[transport.api]
-# Private endpoint, driven from the page context so session cookies apply.
-url = "/api/v0/chat/completion"
-# Placeholders: {messages} {tools} {payload} {prompt} {thinking}.
-# {thinking} is the reasoning flag a deepseek-pro turn needs — DeepSeek's own
-# body calls it "thinking_enabled". A body without it cannot be told which model
-# to use, so a pro turn over this transport is refused rather than answered by
-# the plain model, and the turn falls back to the page instead.
-body = "{\"messages\":{messages},\"stream\":true}"
-framing = "sse"         # sse | json | text
-text_path = "content"   # dot path into each response object
+mode = "gui"
 ```
 
-`api` mode is **not usable against DeepSeek**, and that is a measured finding
-rather than an untested path. Reading the page's own traffic
-(`cargo test -- --ignored live_discover_api_endpoint`) shows the endpoint is
-`POST /api/v0/chat/completion` with the site's own body shape — and that every
-request must carry, besides the bearer token, a per-request proof-of-work header
-(`x-ds-pow-response`, from `/api/v0/chat/create_pow_challenge`) plus two
-fingerprint headers. Without the token the server answers
-`{"code":40003,"msg":"INVALID_TOKEN"}`; with it, `{"code":40300,
-"msg":"MISSING_HEADER"}`. The page solves that challenge itself, which is
-exactly what `gui` mode drives, so synthesizing it here is deliberately out of
-scope. The mechanism is kept, complete and configurable, for endpoints that need
-no such header.
+If Google rejects sign-in from automated Chromium, authenticate in a normal
+supported browser first. Then restart that same profile with a loopback CDP
+port and attach using `--cdp-endpoint http://127.0.0.1:PORT`. This flag also
+works with `chatmodels configure` and `doctor`. Configure saves the endpoint
+for that provider, so later launches can reuse its sign-in while that browser
+is running. Other providers retain their own browser settings. Keep the same
+browser application: copying cookies between Chromium applications can lose
+authentication because their encryption differs. Credentials are entered by
+you; the bridge checks the resulting composer.
 
-### Providers
+Useful flags include `--mode show|silent`, `--profile-dir`, `--cdp-endpoint`,
+`--chatmodel`, `--model`, `--harness`, and `--harness-bin`. For a managed browser,
+`--record-video DIR --record-video-size 960x800` records the driven page.
+Attached browsers can be recorded with [the capture helper](tools/capture_browser.cjs).
 
-Each free chat site is a `[[providers]]` entry: its URL, its selectors, and the
-models it serves. A model is page state (a reasoning chip, a dropdown), so two
-models on one provider share one conversation. The shipped defaults define
-DeepSeek; add Gemini (or any other chat UI) as a second entry:
+## Conversations, tools, and files
 
-```toml
-[[providers]]
-id = "deepseek"
-name = "DeepSeek Chat"
+The bridge forwards the harness's messages and tool catalog without adding
+instructions. It translates JSON tool calls and DeepSeek's native DSML calls
+to OpenAI tool calls. For native calls, the original selected reply's markdown
+preserves code whitespace that the rendered DOM would otherwise change.
+Page reasoning is excluded from replies, following the
+[discussion poll](https://github.com/dixonSolutions/freechatcode/discussions/11).
 
-[providers.chat]
-url = "https://chat.deepseek.com"
-allowed_hosts = ["chat.deepseek.com"]
-routed_url_pattern = "/a/chat/s/"
+A prose response ends the harness turn, including a promise to act or a claim
+that tools are unavailable. The bridge carries that response through; it does
+not invent a tool call. Live failures are tracked in
+[issue #16](https://github.com/dixonSolutions/freechatcode/issues/16).
 
-[providers.selectors]
-composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
-assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
-reasoning = ".ds-think-content"          # excluded from every read of the reply
-send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
-new_chat = "button[aria-label*='new chat' i]"
-thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
-model_label = "div.ds-toggle-button"   # what `freechatcode turns` records
+Requests can identify independent conversations with
+`x-freechatcode-session-id` and `x-freechatcode-agent-id`, or a `conversation`
+object with `session_id` and `agent_id`. OpenCode's native session and parent
+headers are recognized. Each identity gets its own tab, history, and replay
+cache. Tabs expire after five idle minutes, with a limit of 64 per provider.
+Harnesses without agent identity share the launch conversation; automatic
+Codewhale subagent identification remains [issue #1](https://github.com/dixonSolutions/freechatcode/issues/1).
 
-[[providers.models]]
-id = "deepseek-chat"
-name = "DeepSeek Chat"
-toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = false }]
+SQLite stores conversation URLs and message metadata for resume. Explicit
+image data URLs and local file parts upload through the provider's file input,
+up to 16 files and 8 MiB combined. Remote URLs and file IDs are forwarded as
+references. The harness retains ownership of workspace files and permissions.
 
-[[providers.models]]
-id = "deepseek-pro"
-name = "DeepSeek Pro"
-toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = true }]
-```
+## Configuration and troubleshooting
 
-`[[providers.models]]` declares what `/v1/models` advertises; a model's `toggles`
-are the page controls engaged before a turn (and read back after). The selectors
-were read off the live page, not guessed — `reasoning` in particular, which names
-the page's own thinking block so it is never mistaken for the model's answer. Every provider runs as its own tab in
-one relay. Use `--opt=all` to expose all configured providers to the harness;
-the Gemini template uses the page-selected mode, advertised as `gemini`.
-
-Timeouts are knobs too, and they matter: `poll_ms` (how often the page is
-re-read) and `settle_polls` (how many identical reads mean "the reply stopped
-growing") are what took the first turn from tens of seconds to about one. They
-are not, however, how a long conversation is kept alive: a reply is spotted by
-the newest message *changing*, so a conversation that has outgrown the page's
-mounted window does not need a longer `response_secs`, only a correct read.
-
-`settle_polls` is a **quiet window, not a completion check**, and it is the one
-knob that trades latency against a truncated reply. The page renders in bursts
-(measured: gaps of ~165 ms between deltas), so a window smaller than the longest
-pause ends the turn mid-sentence — which is how a 992-character answer once came
-back as 208 characters ending in the middle of a word. The shipped default is
-~3 s, which costs a few seconds between the last word and the end of the turn;
-lower it if you would rather have the speed and can afford the risk.
-
-```toml
-[timeouts]
-login_wait_secs = 900
-login_probe_secs = 20      # headless sign-in probe before reopening a visible window
-response_secs = 300
-poll_ms = 150
-settle_polls = 20
-action_secs = 20
-navigation_secs = 20
-link_probe_secs = 10
-```
-
-Tool forwarding is configurable by name — never hardcoded:
-
-```toml
-[tools]
-forward_all = true                    # false: send only `essential` + `search`
-essential = []                        # e.g. ["read", "edit", "write", "bash"]
-search = ["tool_search"]
-allow_extra = []                      # accept a tool call the request never declared
-```
-
-### Browser lifecycle
-
-FreeChatCode watches the page and its browser context for closure and crashes, so
-it can tell *"the browser is gone"* from *"the page is slow"* without waiting out
-a timeout. Two things then recover it:
-
-- **While idle**, a watcher (`[browser] liveness_check_secs`, default 15 s) checks
-  the browser and reopens it if it has gone, so a browser that is closed or
-  crashes comes back **by itself**, on the conversation in progress. Set it to `0`
-  to turn the check off; it is skipped when `keep_alive = false`, where an absent
-  browser is the point.
-- **Mid-turn**, a turn that fails because the browser vanished is retried once
-  against a freshly opened browser.
-
-```
-[idle] first reply="ONE"
-[idle] conversation=https://chat.deepseek.com/a/chat/s/b60f366c-…
-[idle] pkill status=exit status: 0
- freechatcode: the browser is gone; reopening it on the conversation and carrying on
- freechatcode: the browser is back
-[idle] the browser came back by itself on …/a/chat/s/b60f366c-…
-```
-
-That is a real `SIGKILL` of the browser process, with **no turn sent in between**
-— the browser returned on its own, to the same conversation. Both paths are
-covered by live tests that run against a *copy* of the profile, so they never
-compete with a session you have open.
-
-Retries back off (up to 5 minutes), so a machine with no network does not spin,
-and a non-browser failure — a refusal from the model, say — is reported rather
-than retried.
-
-If the whole wrapper is restarted, the conversation is still found: the
-session→conversation link lives in `~/.codewhale/freechatcode/sessions.db`.
-
-### The prompt
-
-There is no wrapper-written prompt. The request body the harness sends — its
-system message, its conversation, its declared tools — is handed to the chat page
-as-is:
-
-```json
-{"messages":[…],"tools":[…],"tool_choice":…}
-```
-
-Nothing is prepended, appended or reworded. The harness already describes itself,
-its workspace and its tools; a wrapper-authored preamble is the wrapper speaking
-as the model, and a real session answered by reciting that preamble back. If a
-model needs a different framing, that belongs in the harness's own prompt.
-
-The page's own reasoning is not part of the reply. Chat UIs that render the
-model's thinking above the answer (DeepSeek with DeepThink on) expose it in the
-transcript, and it is excluded by selector:
-
-```toml
-[providers.selectors]
-assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
-reasoning = ".ds-think-content"   # never read as the reply, never streamed
-```
-
-Set `reasoning = ""` for a page that renders none.
-
-## Session linking and the turn log
-
-The wrapper keeps an owner-only SQLite database at
-`~/.codewhale/freechatcode/sessions.db` with two tables.
-
-**`chat_links`** maps a Codewhale session id to the DeepSeek Chat conversation it
-relays through:
-
-- A **new** Codewhale session opens the bare chat URL — a fresh conversation.
-- The first reply's conversation URL is recorded against that session id.
-- A **continued** session (`-c`, `-r <id>`, `--session-id <id>`, or the default
-  auto-resume) navigates back to the linked conversation instead of starting
-  over. The wrapper verifies the conversation is still reachable and realigns
-  from scratch if it is not.
-- `freechatcode -- --fresh` starts a new conversation and a new link.
-
-**`chat_turns`** logs one row per turn — *including the ones that failed*:
-
-```
-$ freechatcode turns
-2026-10-08T04:02:15Z  model=unknown             FAILED (dns, blame=network)  session=-  chat=-
-2026-10-08T03:36:50Z  model=DeepThink=off, …   ok tools=yes chars=0         session=06e87ecd-…  chat=…/a/chat/s/49a41ff7-…
-2026-10-08T03:36:39Z  model=DeepThink=off, …   ok tools=no  chars=225       session=06e87ecd-…  chat=…/a/chat/s/49a41ff7-…
-```
-
-Each row carries the session (or `-` when there is none), the conversation, the
-model the page showed, whether tools were used, the answer size — and, for a
-failure, what went wrong and **whose fault it was**:
-
-- `blame=network` — DNS did not resolve, or nothing accepted a connection, or
-  Chromium reported an `ERR_INTERNET_*`/`ERR_CONNECTION_*` code. **Not DeepSeek.**
-- `blame=service` — the endpoint actually answered, with an HTTP status (a
-  "healthy" 404 is a verdict). Only then is it theirs.
-- `blame=wrapper` — a refused request, a bad tool call, or a browser that died.
-- `blame=unknown` — the page stayed silent while the host was demonstrably
-  reachable. That is *not* blamed on the service, because no status was seen.
-
-The table is created and **migrated** on open, so a database written by an
-earlier build gains the failure columns instead of silently losing them.
-
-## Local vision and OCR
-
-Beyond the bridge, this repo carries the local tooling it was built with:
+Defaults are embedded from [assets/config.default.toml](assets/config.default.toml).
+User overrides live at `~/.codewhale/freechatcode/config.toml`, or under
+`$CODEWHALE_HOME/freechatcode`. CLI options override configuration.
 
 ```bash
-python3 tools/vision.py --prompt "Describe this UI." screenshot.png
-python3 tools/ocr.py invoice.png                 # tesseract, falls back to the model
-python3 tools/ocr.py invoice.png --backend ollama
+freechatcode health
+freechatcode turns --limit 20
+freechatcode feedback --title "Reproducible failure" --body-file report.md
 ```
 
-Both run offline against a local model (verified here with `gemma4:26b` through
-Ollama) and `tools/ocr.py` prefers `tesseract` for exact transcription. See
-[tools/README.md](tools/README.md).
+The feedback command creates a GitHub issue. Include the harness/provider,
+steps, expected result, and relevant diagnostic output. Audit logs contain
+request and reply content; review them before sharing. The relay binds to
+loopback and uses a random bearer token; local audit and database files use
+owner-only permissions.
 
-## Security
+For detailed settings, recovery behavior, and timeouts, read
+[the configuration reference](docs/configuration.md). Historical measurements
+and test evidence live in [STATUS.md](STATUS.md). Ownership rules are in
+[the design document](docs/design.md).
 
-- The relay binds `127.0.0.1` on an ephemeral port with a random `cw_…` bearer
-  token; there are no CORS headers, so browser scripts cannot read it
-  cross-origin.
-- Credentials and cookies stay in the Chromium profile. The wrapper never reads
-  them and never calls a private endpoint unless you set `[transport] mode = "api"`.
-- The session-link database and the audit log are created owner-only (0700 dir,
-  0600 files). Audit records go to `~/.codewhale/deepseek-chat/audit/`.
-- `--record-video` records the page the wrapper drives, not your desktop.
-
-**Remote desktop, if you enable it**, is separately documented and separately
-risky: GNOME Remote Desktop binds every interface and the default firewall zone
-on this machine already permits the port. Read
-[docs/remote-desktop.md](docs/remote-desktop.md) before turning it on.
-
-## Checks
+## Development
 
 ```bash
+cargo fmt --check
 cargo test --locked
-cargo clippy --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The suite covers the relay protocol, CORS and auth behavior, incremental
-streaming deltas, tool-call normalization, session-link and turn-log storage,
-config precedence, and a real Playwright round trip against a local mock chat
-page. The live test — `cargo test -- --ignored` — drives the actual DeepSeek
-Chat page and needs a signed-in profile.
+Live tests are ignored by default and require signed-in provider profiles.
+Run a selected live test with `cargo test NAME -- --ignored --nocapture`.
+The demo recorder uses isolated workspaces, requires a failing baseline, and
+checks the resulting files with an independent test process. The renderer
+refuses failed captures by default; `--diagnostic` labels a failure explicitly.
+Current validation: **99 active tests pass**, with 23 live tests ignored by
+default. See [the live harness matrix](docs/live-verification.md) for measured
+results and remaining limitations.
 
 ## License
 
-MIT
+[MIT](LICENSE)

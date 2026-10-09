@@ -900,6 +900,13 @@ async fn relay_turn(
     let assistant = match relay.finish(request, raw.clone(), &state.options) {
         Ok(assistant) => assistant,
         Err(message) => {
+            let _ = state
+                .audit
+                .append(json!({
+                    "kind":"error", "request_id":request_id,
+                    "browser_response":raw, "parse_error":message
+                }))
+                .await;
             state
                 .record_failure(Failure::request(message.clone()))
                 .await;
@@ -1290,6 +1297,20 @@ fn extract_tool_call_envelope(text: &str) -> Option<(Value, String)> {
     found
 }
 
+/// Detect the structural array key of an attempted JSON tool envelope. A bare
+/// mention of the name in prose is not an attempted call.
+fn tool_call_candidate_start(text: &str) -> Option<usize> {
+    text.match_indices("\"tool_calls\"")
+        .find_map(|(index, key)| {
+            let tail = text[index + key.len()..].trim_start();
+            let tail = tail.strip_prefix(':')?.trim_start();
+            if !tail.starts_with('[') {
+                return None;
+            }
+            text[..index].rfind('{')
+        })
+}
+
 /// Best-effort unescape of the common JSON string escapes.
 fn unescape_json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -1318,6 +1339,14 @@ fn unescape_json_string(text: &str) -> String {
 fn partial_content(raw: &str) -> String {
     if let Some(prefix) = native_calls::visible_prefix(raw) {
         return prefix.to_owned();
+    }
+    if let Some(start) = tool_call_candidate_start(raw) {
+        let candidate = &raw[start..];
+        if balanced_object_end(candidate)
+            .is_none_or(|end| serde_json::from_str::<Value>(&candidate[..end]).is_err())
+        {
+            return raw[..start].to_owned();
+        }
     }
     let trimmed = raw.trim_start();
     let trimmed = trimmed
@@ -1461,6 +1490,9 @@ fn parse_assistant_message(
                 }
                 return Ok(message);
             }
+        }
+        if tool_call_candidate_start(raw).is_some() {
+            return Err("the model returned malformed JSON tool calls; refusing to treat an unexecuted call as a final answer".into());
         }
         return Ok(json!({"role": "assistant", "content": raw}));
     };
@@ -2103,6 +2135,22 @@ mod tests {
         assert_eq!(
             partial_content(r#"{"type":"final","content":"I will use tool_calls now"}"#),
             "I will use tool_calls now"
+        );
+    }
+
+    #[test]
+    fn malformed_json_tool_calls_fail_without_streaming_arguments() {
+        let raw = "JSON\n{\"type\":\"tool_calls\",\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":{\"command\":\"first\nsecond\"}}}]}";
+        assert_eq!(partial_content(raw), "JSON\n");
+        let error = parse_assistant_message(raw, None, &ToolPolicy::default()).unwrap_err();
+        assert!(error.contains("malformed JSON"), "{error}");
+        assert!(
+            parse_assistant_message(
+                "Prose mentioning \"tool_calls\" is still prose",
+                None,
+                &ToolPolicy::default()
+            )
+            .is_ok()
         );
     }
 

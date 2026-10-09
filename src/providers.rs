@@ -63,6 +63,23 @@ pub fn drop_provider(config: &mut Config, name: &str) -> Result<String, String> 
 mod tests {
     use super::*;
     #[test]
+    fn provider_browser_attachment_survives_configuration_reload() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let mut config = Config::defaults();
+        config.providers = catalog();
+        config.providers[1].chat.cdp_endpoint = Some("http://127.0.0.1:9317".into());
+        crate::config::save_providers(&path, &config).unwrap();
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            loaded.providers[1].chat.cdp_endpoint.as_deref(),
+            Some("http://127.0.0.1:9317")
+        );
+        assert_eq!(loaded.providers[0].chat.cdp_endpoint, None);
+        assert_eq!(loaded.browser.cdp_endpoint, None);
+    }
+
+    #[test]
     fn dropping_the_default_uses_the_first_remaining_provider_and_preserves_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

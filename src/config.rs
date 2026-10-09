@@ -124,6 +124,9 @@ impl Default for RelayConfig {
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ChatConfig {
+    /// Saved attachment to this provider's authenticated native browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_endpoint: Option<String>,
     pub url: String,
     pub allowed_hosts: Vec<String>,
     #[serde(default)]
@@ -132,6 +135,10 @@ pub struct ChatConfig {
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Selectors {
+    /// Original markdown property on the selected reply's React component.
+    /// Used only for native tool calls whose code would be altered by rendering.
+    #[serde(default)]
+    pub assistant_source_property: String,
     pub composer: String,
     pub assistant: String,
     pub send: String,

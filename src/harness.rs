@@ -21,6 +21,8 @@ pub enum HarnessKind {
     Codewhale,
     /// opencode (sst/opencode) — configured via `OPENCODE_CONFIG` + `-m`.
     Opencode,
+    /// Official OpenClaw — isolated agent exec with a temporary provider config.
+    Openclaw,
 }
 
 impl HarnessKind {
@@ -32,11 +34,12 @@ impl HarnessKind {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if name.contains("opencode") {
+        if name.contains("openclaw") {
+            HarnessKind::Openclaw
+        } else if name.contains("opencode") {
             HarnessKind::Opencode
         } else {
-            // Unknown names fall back to the Codewhale contract; a future
-            // openclaw/hermes adapter adds its own detection here.
+            // Explicit --harness is available for renamed executables.
             HarnessKind::Codewhale
         }
     }
@@ -51,6 +54,7 @@ pub struct HarnessSpawn {
     /// A temp config file that must outlive the harness process. Held here so
     /// it is removed when the run ends (auto-delete on drop).
     _config: Option<tempfile::NamedTempFile>,
+    _state: Option<tempfile::TempDir>,
 }
 
 /// Build the spawn contract that points `kind` at the relay serving `model_id`.
@@ -86,6 +90,7 @@ pub fn spawn_contract_with_models(
             ],
             envs: Vec::new(),
             _config: None,
+            _state: None,
         }),
         HarnessKind::Opencode => {
             // opencode reads providers from a JSON config, not from flags. A
@@ -114,6 +119,43 @@ pub fn spawn_contract_with_models(
                 argv: vec!["-m".into(), format!("freechat/{model_id}").into()],
                 envs: vec![("OPENCODE_CONFIG".into(), path.into_os_string())],
                 _config: Some(file),
+                _state: None,
+            })
+        }
+        HarnessKind::Openclaw => {
+            let workspace = std::env::current_dir().context("resolve OpenClaw workspace")?;
+            let state = tempfile::tempdir().context("create isolated OpenClaw runtime state")?;
+            let config = serde_json::json!({
+                "models": {"mode":"replace", "providers": {"freechat": {
+                    "baseUrl": base_url, "apiKey": token, "api":"openai-completions",
+                    "models":models.iter().map(|id|serde_json::json!({
+                        "id":id,"name":id,"reasoning":false,"input":["text","image"],
+                        "contextWindow":131072,"maxTokens":8192,
+                        "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+                    })).collect::<Vec<_>>()
+                }}},
+                "agents":{"defaults":{"workspace":workspace,"model":{"primary":format!("freechat/{model_id}")}}}
+            });
+            let mut file = tempfile::NamedTempFile::new().context("create temp OpenClaw config")?;
+            file.write_all(config.to_string().as_bytes())
+                .context("write OpenClaw config")?;
+            Ok(HarnessSpawn {
+                argv: vec![
+                    "agent".into(),
+                    "exec".into(),
+                    "--config".into(),
+                    file.path().as_os_str().to_owned(),
+                    "--model".into(),
+                    format!("freechat/{model_id}").into(),
+                    "--cwd".into(),
+                    workspace.into_os_string(),
+                ],
+                envs: vec![(
+                    "OPENCLAW_STATE_DIR".into(),
+                    state.path().as_os_str().to_owned(),
+                )],
+                _config: Some(file),
+                _state: Some(state),
             })
         }
     }
@@ -125,6 +167,10 @@ mod tests {
 
     #[test]
     fn detection_reads_the_binary_name() {
+        assert_eq!(
+            HarnessKind::detect(Path::new("/x/openclaw")),
+            HarnessKind::Openclaw
+        );
         assert_eq!(
             HarnessKind::detect(Path::new("/x/opencode")),
             HarnessKind::Opencode
@@ -167,6 +213,49 @@ mod tests {
             ]
         );
         assert!(spawn.envs.is_empty());
+    }
+
+    #[test]
+    fn openclaw_contract_is_isolated_and_removed_after_spawn() {
+        let spawn = spawn_contract_with_models(
+            HarnessKind::Openclaw,
+            "http://127.0.0.1:1/v1",
+            "tok",
+            "gemini",
+            &["gemini".into(), "deepseek-chat".into()],
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from(&spawn.argv[3]);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            &spawn.argv[..3],
+            &[
+                OsString::from("agent"),
+                OsString::from("exec"),
+                OsString::from("--config")
+            ]
+        );
+        assert_eq!(value["models"]["mode"], "replace");
+        assert_eq!(
+            value["models"]["providers"]["freechat"]["baseUrl"],
+            "http://127.0.0.1:1/v1"
+        );
+        assert_eq!(value["models"]["providers"]["freechat"]["apiKey"], "tok");
+        assert_eq!(
+            value["models"]["providers"]["freechat"]["models"][1]["id"],
+            "deepseek-chat"
+        );
+        assert_eq!(
+            value["agents"]["defaults"]["model"]["primary"],
+            "freechat/gemini"
+        );
+        assert_eq!(spawn.envs[0].0, "OPENCLAW_STATE_DIR");
+        let state = std::path::PathBuf::from(&spawn.envs[0].1);
+        assert!(state.exists());
+        drop(spawn);
+        assert!(!state.exists());
+        assert!(!path.exists());
     }
 
     #[test]

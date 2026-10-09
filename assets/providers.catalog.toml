@@ -27,12 +27,12 @@ name = "GoogleAIMode"
 [providers.chat]
 url = "https://www.google.com/ai"
 allowed_hosts = ["www.google.com", "google.com"]
-routed_url_pattern = "/search"
+routed_url_pattern = "mtid="
 [providers.selectors]
-composer = "textarea, [contenteditable='true'][role='textbox']"
-assistant = "[data-message-role='assistant'], [data-role='assistant']"
+composer = "textarea[aria-label='Ask anything']:visible"
+assistant = "[role='main'] .n6owBd, [role='main'] .otQkpb, [role='main'] .Y3BBE"
 send = "button[aria-label*='Send' i]"
-new_chat = "a[href='/ai']"
+new_chat = "[aria-label='Start a new AI Mode search'], [aria-label='New thread']"
 search_toggle = ""
 thinking_toggle = ""
 file_upload = "input[type='file']"

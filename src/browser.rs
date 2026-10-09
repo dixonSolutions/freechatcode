@@ -167,6 +167,32 @@ impl BrowserChat {
         &self.spec.provider.selectors
     }
 
+    pub(crate) async fn reply_text(
+        &self,
+        reply: &playwright_rs::protocol::Locator,
+    ) -> Result<String, String> {
+        let rendered = reply.inner_text().await.map_err(|e| e.to_string())?;
+        let marker = "<｜｜DSML";
+        let Some(visible_start) = rendered.find(marker) else {
+            return Ok(rendered);
+        };
+        let property = &self.selectors().assistant_source_property;
+        if property.is_empty() {
+            return Ok(rendered);
+        }
+        // Read only the selected answer component, never the page's transcript,
+        // reasoning, network responses, or credentials. Markdown rendering can
+        // collapse Python indentation and consume underscores inside tool args.
+        let source: Option<String> = reply.evaluate("(element, property) => { const key = Object.keys(element).find(k => k.startsWith('__reactFiber')); for (let fiber = element[key], depth = 0; fiber && depth < 30; fiber = fiber.return, depth++) { const value = fiber.memoizedProps?.[property]; if (typeof value === 'string' && value.includes('<｜｜DSML')) return value; } return null; }", Some(property)).await.map_err(|e| e.to_string())?;
+        let source = source.ok_or("native tool-call source is unavailable; refusing rendered arguments that may have lost formatting")?;
+        let start = source.find(marker).expect("source contains marker");
+        Ok(format!(
+            "{}{}",
+            &rendered[..visible_start],
+            &source[start..]
+        ))
+    }
+
     pub(crate) fn timeouts(&self) -> &Timeouts {
         &self.spec.config.timeouts
     }
@@ -804,13 +830,7 @@ impl BrowserChat {
             .await
             .map_err(|_| "could not inspect the visible assistant transcript".to_owned())?;
         let previous_text = if previous_count > 0 {
-            assistants
-                .last()
-                .inner_text()
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_owned()
+            self.reply_text(&assistants.last()).await?.trim().to_owned()
         } else {
             String::new()
         };
@@ -821,6 +841,20 @@ impl BrowserChat {
             .map_err(|error| {
                 format!("could not enter the request in the visible chat composer: {error}")
             })?;
+        let entered: String = composer
+            .evaluate(
+                "element => ('value' in element ? element.value : element.innerText)",
+                None::<&()>,
+            )
+            .await
+            .map_err(|error| format!("could not verify the entered request: {error}"))?;
+        if entered.replace("\r\n", "\n") != prompt.replace("\r\n", "\n") {
+            return Err(format!(
+                "the provider composer altered or truncated the request ({} characters entered, {} requested); refusing to submit incomplete context",
+                entered.chars().count(),
+                prompt.chars().count()
+            ));
+        }
         let send = page.locator(&self.selectors().send);
         if send.count().await.unwrap_or(0) > 0 && send.last().is_visible().await.unwrap_or(false) {
             // File parsing disables custom div-based controls as well as native
@@ -931,7 +965,7 @@ impl BrowserChat {
             // survives. One element per poll is cheap; the whole transcript is
             // what made the first turn feel stalled.
             let text = if count > 0 {
-                assistants.last().inner_text().await.unwrap_or_default()
+                self.reply_text(&assistants.last()).await?
             } else {
                 String::new()
             };
@@ -1520,7 +1554,7 @@ pub(crate) fn make_browser(
             provider: provider.clone(),
             url,
             profile,
-            cdp_endpoint,
+            cdp_endpoint: cdp_endpoint.or_else(|| provider.chat.cdp_endpoint.clone()),
         },
         session: Mutex::new(None),
         transport: config.transport.mode,

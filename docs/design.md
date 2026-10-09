@@ -13,7 +13,8 @@ a limitation to work around; it is the resource this project exists to use. It i
 also why a long conversation costs nothing to continue and why a resumed session
 picks up where it left off.
 
-**Codewhale (the harness) owns the loop.** It decides when to call a tool, runs
+**The coding harness owns the loop.** Codewhale, OpenCode, and OpenClaw use
+their own adapters. Each harness decides when to call a tool, runs
 it in the workspace, feeds the result back, keeps going until it is done, and
 holds the permissions, approvals, and tool catalog. None of that is the
 wrapper's business, and the wrapper must never try to do it.
@@ -33,11 +34,15 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
   conversation and nothing else.
 - **No transcript management.** The page holds the thread; the wrapper sends the
   *delta* Codewhale added since the last assistant message, and feeds the whole
-  transcript only when the conversation is new or the link is stale. It keeps no
-  copy of the conversation.
+  transcript only when the conversation is new or the link is stale. It tracks
+  accepted harness history and completed-turn replay per explicit identity.
+  Audit logs record the original requests and replies; SQLite stores links and
+  message metadata. These records do not replace the provider conversation.
 - **A wire adaptation, not a rewrite.** A reply is read as prose, a native DSML invocation, or a `tool_calls` object — found
   wherever the model wrote it, fenced or trailing or after its own reasoning —
-  and normalised to the OpenAI shape. The model's words are otherwise carried
+  and normalised to the OpenAI shape. Native tool arguments are read from the
+  selected reply's original markdown when configured, preserving code whitespace
+  that rendered markdown can alter. The model's words are otherwise carried
   through unchanged.
 - **The prompt is the harness's, verbatim.** The wrapper writes no instruction
   text of its own: no preamble describing the transport, no contract the model
@@ -81,8 +86,8 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
   phrasing heuristic that decides "this reply sounds like a promise, retry it".
   That would make the wrapper a participant, and a participant's guesses are
   indistinguishable — to the user — from the model's.
-- **It does not keep conversation state of its own** beyond the session link and
-  the browser page it drives.
+- **It does not invent conversation state.** Per-identity history and replay
+  contain the harness's actual messages and completed browser turns.
 
 ## Where resume lives
 

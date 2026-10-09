@@ -49,10 +49,10 @@ struct Args {
     chat_url: Option<String>,
 
     /// Codewhale executable to launch after the browser is ready.
-    #[arg(long, env = "CODEWHALE_BINARY", global = true)]
+    #[arg(long, alias = "harness-bin", env = "CODEWHALE_BINARY", global = true)]
     codewhale_bin: Option<String>,
 
-    /// Agent harness to launch: `codewhale` (default) or `opencode`. Guessed
+    /// Agent harness to launch: Codewhale (default), OpenCode, or OpenClaw. Guessed
     /// from the binary's file name when omitted.
     #[arg(long, value_enum, global = true)]
     harness: Option<HarnessKind>,
@@ -865,7 +865,7 @@ async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Resul
 
 async fn configure_provider(home: &Path, config: &mut Config, name: &str) -> Result<()> {
     let id = freechatcode::providers::canonical(name);
-    let provider = config
+    let mut provider = config
         .provider(&id)
         .cloned()
         .or_else(|| {
@@ -874,26 +874,43 @@ async fn configure_provider(home: &Path, config: &mut Config, name: &str) -> Res
                 .find(|p| p.id == id)
         })
         .context("unknown provider; use chatmodels list")?;
+    if config.browser.cdp_endpoint.is_some() {
+        provider.chat.cdp_endpoint = config.browser.cdp_endpoint.clone();
+    }
     let mut visible = config.clone();
     visible.browser.headless = false;
-    visible.browser.cdp_endpoint = None;
-    visible.browser.mode = config::BrowserMode::Managed;
+    if visible.browser.cdp_endpoint.is_none() {
+        visible.browser.mode = config::BrowserMode::Managed;
+    }
     let browser = make_browser(
         &visible,
         &provider,
         home,
         None,
-        None,
+        visible.browser.cdp_endpoint.clone(),
         provider.chat.url.clone(),
     );
-    println!(
-        "Configuring {}. Sign in in Chromium; the profile is saved per provider.",
-        provider.name
-    );
+    if browser.spec.cdp_endpoint.is_some() {
+        println!(
+            "Configuring {} using the attached browser's existing sign-in.",
+            provider.name
+        );
+    } else {
+        println!(
+            "Configuring {}. Sign in in Chromium; the profile is saved per provider.",
+            provider.name
+        );
+    }
     let result = browser.ensure_open().await;
     browser.shutdown().await;
     result.map_err(anyhow::Error::msg)?;
-    if config.provider(&id).is_none() {
+    if let Some(existing) = config
+        .providers
+        .iter_mut()
+        .find(|existing| existing.id == id)
+    {
+        existing.chat.cdp_endpoint = provider.chat.cdp_endpoint;
+    } else {
         config.providers.push(provider);
     }
     if config.default_provider.is_none() {
@@ -906,9 +923,16 @@ async fn configure_provider(home: &Path, config: &mut Config, name: &str) -> Res
     Ok(())
 }
 
-async fn run_chatmodels(home: &Path, command: ChatModelCommands) -> Result<()> {
+async fn run_chatmodels(
+    home: &Path,
+    command: ChatModelCommands,
+    cdp_endpoint: Option<String>,
+) -> Result<()> {
     let path = config::user_config_path(home);
     let mut config = Config::load(Some(&path)).map_err(anyhow::Error::msg)?;
+    if cdp_endpoint.is_some() {
+        config.browser.cdp_endpoint = cdp_endpoint;
+    }
     let reconfigure = matches!(&command, ChatModelCommands::ReConfigure { .. });
     match command {
         ChatModelCommands::List => {
@@ -1041,7 +1065,7 @@ async fn run() -> Result<()> {
 
     let (binary_hint, codewhale_args) = match args.command {
         Some(Commands::Chatmodels { command }) => {
-            run_chatmodels(&home, command).await?;
+            run_chatmodels(&home, command, args.cdp_endpoint.clone()).await?;
             return Ok(());
         }
         Some(Commands::Feedback {
@@ -1091,8 +1115,11 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Doctor { provider }) => {
-            let config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
+            let mut config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
                 .map_err(|error| anyhow::anyhow!(error))?;
+            if args.cdp_endpoint.is_some() {
+                config.browser.cdp_endpoint = args.cdp_endpoint.clone();
+            }
             run_doctor(&config, &home, provider.as_deref()).await?;
             return Ok(());
         }
@@ -1111,6 +1138,9 @@ async fn run() -> Result<()> {
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
+    if args.cdp_endpoint.is_some() {
+        config.browser.cdp_endpoint = args.cdp_endpoint.clone();
+    }
     if let Some(name) = &args.chatmodel {
         let id = freechatcode::providers::canonical(name);
         if config.provider(&id).is_none() {
@@ -1207,10 +1237,28 @@ async fn run() -> Result<()> {
         }
         setup::find_codewhale_binary(None)?
     };
-    println!("Using codewhale binary: {}", codewhale_bin.display());
+    println!("Using harness binary: {}", codewhale_bin.display());
     let harness_kind = args
         .harness
         .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin));
+    if harness_kind == HarnessKind::Openclaw {
+        let help = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&codewhale_bin).arg("--help").output(),
+        )
+        .await
+        .context("OpenClaw help timed out")?
+        .context("inspect OpenClaw command support")?;
+        if !help.status.success()
+            || !String::from_utf8_lossy(&help.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("agent"))
+        {
+            bail!(
+                "this OpenClaw executable has no agent command. The Cargo openclaw-cli 0.1.0 package exposes gateway/configuration commands, not a coding harness. Use official OpenClaw with --harness-bin /path/to/openclaw"
+            );
+        }
+    }
     if pinned.is_none()
         && let Err(error) = config::remember_binary(&config_path, &codewhale_bin)
     {
@@ -1453,6 +1501,7 @@ async fn run() -> Result<()> {
     let harness_name = match harness_kind {
         HarnessKind::Codewhale => "Codewhale",
         HarnessKind::Opencode => "opencode",
+        HarnessKind::Openclaw => "OpenClaw",
     };
     println!("Starting {harness_name} with the chat browser route.");
     println!("The local relay listens only on {address}; no browser CORS access is enabled.");
@@ -1773,6 +1822,110 @@ mod tests {
         let _ = browser.close().await;
         parent.shutdown().await;
     }
+    #[tokio::test]
+    async fn native_tool_arguments_use_the_selected_original_markdown() {
+        let playwright = Playwright::launch().await.unwrap();
+        let browser = playwright.chromium().launch().await.unwrap();
+        let page = browser.new_page().await.unwrap();
+        let source = "**Reading**\n\n<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"write\"><｜｜DSML｜｜ parameter name=\"content\" string=\"true\">def f():\n    return __name__\n</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>";
+        page.set_content("<div class=reply>Reading<br><br>&lt;｜｜DSML｜｜ calls&gt;<br>def f():<br>    return <strong>name</strong></div>", None).await.unwrap();
+        page.locator(".reply").evaluate::<(), _>("(element, source) => { element.__reactFiber$test = {memoizedProps:{markdown:source}}; }", Some(&source)).await.unwrap();
+        let config = Config::defaults();
+        let home = tempfile::tempdir().unwrap();
+        let ui = make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        );
+        let value = ui.reply_text(&page.locator(".reply")).await.unwrap();
+        assert!(value.contains("def f():\n    return __name__\n"), "{value}");
+        assert!(value.starts_with("Reading\n\n<｜｜DSML"), "{value}");
+        page.locator(".reply")
+            .evaluate::<(), _>(
+                "element => { delete element.__reactFiber$test; }",
+                None::<&()>,
+            )
+            .await
+            .unwrap();
+        assert!(ui.reply_text(&page.locator(".reply")).await.is_err());
+        browser.close().await.unwrap();
+        playwright.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn provider_attachment_endpoint_does_not_leak_to_other_providers() {
+        let config = Config::defaults();
+        let home = tempfile::tempdir().unwrap();
+        let mut google = freechatcode::providers::catalog()
+            .into_iter()
+            .find(|p| p.id == "gemini")
+            .unwrap();
+        google.chat.cdp_endpoint = Some("http://127.0.0.1:9317".into());
+        let attached = make_browser(
+            &config,
+            &google,
+            home.path(),
+            None,
+            None,
+            google.chat.url.clone(),
+        );
+        assert_eq!(attached.spec.cdp_endpoint, google.chat.cdp_endpoint);
+        let managed = make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        );
+        assert_eq!(managed.spec.cdp_endpoint, None);
+        let override_endpoint = Some("http://127.0.0.1:9320".into());
+        let override_ui = make_browser(
+            &config,
+            &google,
+            home.path(),
+            None,
+            override_endpoint.clone(),
+            google.chat.url.clone(),
+        );
+        assert_eq!(override_ui.spec.cdp_endpoint, override_endpoint);
+    }
+
+    #[tokio::test]
+    async fn truncated_composer_context_is_refused_before_send() {
+        let playwright = Playwright::launch().await.unwrap();
+        let browser = playwright.chromium().launch().await.unwrap();
+        let page = browser.new_page().await.unwrap();
+        page.set_content("<textarea maxlength=4></textarea><button type=submit onclick=\"this.dataset.sent='yes'\">Send</button>", None).await.unwrap();
+        let config = Config::defaults();
+        let home = tempfile::tempdir().unwrap();
+        let ui = make_browser(
+            &config,
+            &config.providers[0],
+            home.path(),
+            None,
+            None,
+            config.providers[0].chat.url.clone(),
+        );
+        let error = ui
+            .submit(&page, "longer request", false, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("truncated"), "{error}");
+        assert_eq!(
+            page.locator("button")
+                .get_attribute("data-sent")
+                .await
+                .unwrap(),
+            None
+        );
+        browser.close().await.unwrap();
+        playwright.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn attachments_reach_the_browser_file_input() {
         let playwright = Playwright::launch().await.unwrap();
