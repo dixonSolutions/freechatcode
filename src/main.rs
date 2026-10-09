@@ -1165,6 +1165,34 @@ mod tests {
     use playwright_rs::Playwright;
     use playwright_rs::protocol::{BrowserContextOptions, Page};
 
+    fn live_state(
+        token: &str,
+        ui: Arc<dyn ChatUi>,
+        audit: Arc<dyn AuditSink>,
+        options: BridgeOptions,
+    ) -> ServerState {
+        let provider = Config::defaults().providers.remove(0);
+        ServerState::with_routes(
+            token.to_owned(),
+            vec![RouteGroup {
+                ui,
+                start_fresh: options.start_fresh,
+                models: provider
+                    .models
+                    .into_iter()
+                    .map(|model| ModelSpec {
+                        id: model.id,
+                        owned_by: provider.id.clone(),
+                        name: model.name,
+                        toggles: model.toggles,
+                    })
+                    .collect(),
+            }],
+            audit,
+            options,
+        )
+    }
+
     const TEST_MODEL_ID: &str = "deepseek-chat";
     const TEST_PRO_MODEL_ID: &str = "deepseek-pro";
 
@@ -1702,7 +1730,7 @@ mod tests {
         });
         ui.ensure_open().await.expect("open the browser");
 
-        let state = ServerState::with_options(
+        let state = live_state(
             "live-token",
             ui.clone(),
             Arc::new(QuietAudit),
@@ -2123,7 +2151,7 @@ mod tests {
         let audit = JsonlAudit::create(&dir.path().join("audit"))
             .await
             .expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2224,7 +2252,7 @@ mod tests {
         let audit = JsonlAudit::create(&dir.path().join("audit"))
             .await
             .expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2500,7 +2528,7 @@ mod tests {
         ui.ensure_open().await.expect("open the browser");
         let audit_dir = dir.path().join("audit");
         let audit = JsonlAudit::create(&audit_dir).await.expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2611,7 +2639,12 @@ mod tests {
             last_http_status: Mutex::new(None),
         });
         ui.ensure_open().await.expect("open the browser");
-        let state = ServerState::new("secret", ui.clone(), Arc::new(QuietAudit));
+        let state = live_state(
+            "secret",
+            ui.clone(),
+            Arc::new(QuietAudit),
+            BridgeOptions::default(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -3919,7 +3952,7 @@ mod tests {
                         ws_xpixel: 0,
                         ws_ypixel: 0,
                     };
-                    libc::ioctl(master, libc::TIOCSWINSZ.into(), &window);
+                    libc::ioctl(master, libc::TIOCSWINSZ, &window);
                     Self {
                         master: std::fs::File::from_raw_fd(master),
                         slave,
@@ -4035,7 +4068,7 @@ mod tests {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
