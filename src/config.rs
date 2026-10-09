@@ -34,14 +34,15 @@ pub fn user_config_path(home: &Path) -> PathBuf {
 pub fn migrate_legacy_home(home: &Path) {
     let legacy = home.join("deepchatcode");
     let current = home.join("freechatcode");
-    if legacy.exists() && !current.exists() {
-        if let Err(error) = std::fs::rename(&legacy, &current) {
-            eprintln!(
-                "freechatcode: could not migrate legacy config dir {} to {}: {error}",
-                legacy.display(),
-                current.display()
-            );
-        }
+    if !legacy.exists() || current.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::rename(&legacy, &current) {
+        eprintln!(
+            "freechatcode: could not migrate legacy config dir {} to {}: {error}",
+            legacy.display(),
+            current.display()
+        );
     }
 }
 

@@ -25,6 +25,7 @@ use freechatcode::config::{
     self, ApiTransportConfig, BrowserMode, ChatConfig, Config, RunMode, Selectors, Timeouts,
     TransportMode,
 };
+use freechatcode::harness::{self, HarnessKind};
 use freechatcode::health;
 use freechatcode::sessions::{self, SessionLinks, TurnRow};
 use freechatcode::setup;
@@ -55,6 +56,11 @@ struct Args {
     /// Codewhale executable to launch after the browser is ready.
     #[arg(long, env = "CODEWHALE_BINARY")]
     codewhale_bin: Option<String>,
+
+    /// Agent harness to launch: `codewhale` (default) or `opencode`. Guessed
+    /// from the binary's file name when omitted.
+    #[arg(long, value_enum)]
+    harness: Option<HarnessKind>,
 
     /// Browser profile directory.
     #[arg(long)]
@@ -2076,32 +2082,40 @@ async fn run() -> Result<()> {
         println!("[browser] keep_alive = false: the browser closes after every turn.");
     }
 
-    // Codewhale still gets the terminal on stdin; the wrapper just no longer
+    // The harness still gets the terminal on stdin; the wrapper just no longer
     // holds it itself.
     let child_stdin = match terminal {
         Some(terminal) => Stdio::from(terminal),
         None => Stdio::inherit(),
     };
-    let mut child = Command::new(&codewhale_bin)
-        .args([
-            OsString::from("--provider"),
-            OsString::from("openai"),
-            OsString::from("--model"),
-            OsString::from(model_id),
-            OsString::from("--base-url"),
-            OsString::from(base_url),
-            OsString::from("--api-key"),
-            OsString::from(token),
-        ])
+    let harness_kind = args
+        .harness
+        .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin));
+    let spawn = harness::spawn_contract(harness_kind, &base_url, &token, &model_id)?;
+    let mut command = Command::new(&codewhale_bin);
+    command.args(&spawn.argv);
+    for (key, value) in &spawn.envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .args(codewhale_args)
         .stdin(child_stdin)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("launch Codewhale executable {:?}", codewhale_bin))?;
+        .with_context(|| {
+            format!(
+                "launch {:?} harness executable {:?}",
+                harness_kind, codewhale_bin
+            )
+        })?;
+    let harness_name = match harness_kind {
+        HarnessKind::Codewhale => "Codewhale",
+        HarnessKind::Opencode => "opencode",
+    };
     eprintln!(
-        "freechatcode: Codewhale started at {:.2}s (browser warming in parallel)",
+        "freechatcode: {harness_name} started at {:.2}s (browser warming in parallel)",
         startup.elapsed().as_secs_f64()
     );
 

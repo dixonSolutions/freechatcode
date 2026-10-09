@@ -64,6 +64,7 @@ const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
 pub mod config;
+pub mod harness;
 pub mod health;
 pub mod sessions;
 pub mod setup;
