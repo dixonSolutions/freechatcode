@@ -22,8 +22,8 @@ use freechatcode::health;
 use freechatcode::sessions::{self, SessionLinks, TurnRow};
 use freechatcode::setup;
 use freechatcode::{
-    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, ModelSpec, RouteGroup,
-    ServerState, ToolPolicy, TurnRecord, TurnSink, router,
+    AuditSink, BridgeOptions, ChatUi, Failure, ModelSpec, RouteGroup, ServerState, ToolPolicy,
+    TurnRecord, TurnSink, router,
 };
 
 mod browser;
@@ -829,7 +829,6 @@ async fn run() -> Result<()> {
 
     // Resolve the Codewhale session this run will use (shared across providers).
     let workspace = std::env::current_dir().context("resolve the working directory")?;
-    let project_dir = workspace.to_string_lossy().into_owned();
     let sessions_dir = home.join("sessions");
     let links = Arc::new(
         SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
@@ -1004,15 +1003,8 @@ async fn run() -> Result<()> {
         search: config.tools.search.clone(),
         allow_extra: config.tools.allow_extra.clone(),
     };
-    // The instruction text is never hardcoded: read the path from config, else
-    // use the committed default embedded in the binary. `{project_dir}` is filled
-    // here; `{payload}` is filled per request by the relay.
-    let template: String = match config.codewhale.system_prompt.as_deref() {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("read the configured system prompt at {path}"))?,
-        None => DEFAULT_SYSTEM_PROMPT.to_owned(),
-    };
-    let system_prompt: Arc<str> = Arc::from(template.replace("{project_dir}", &project_dir));
+    // The harness's own messages are the prompt: the wrapper writes none of its
+    // own, so there is no template to read and no `{project_dir}` to fill.
     let app = router(
         ServerState::with_routes(
             token.clone(),
@@ -1023,8 +1015,6 @@ async fn run() -> Result<()> {
                 // Per-tab freshness lives on each RouteGroup; this field only
                 // drives the single-tab convenience constructor.
                 start_fresh: false,
-                system_prompt,
-                forward_system_prompt: config.relay.forward_system_prompt,
             },
         )
         .with_turns(turns),
@@ -1346,6 +1336,33 @@ mod tests {
         assert!(selectors.assistant.contains("ds-markdown"));
         assert!(selectors.send.contains("send"));
         assert!(selectors.new_chat.contains("new-chat"));
+        // Verified against DeepSeek's own stylesheet, which styles the reasoning
+        // as `.ds-think-content .ds-markdown` — i.e. the reasoning *is* a
+        // markdown block, and would be caught by `assistant` without this.
+        assert_eq!(selectors.reasoning, ".ds-think-content");
+    }
+
+    #[test]
+    fn the_pages_reasoning_is_excluded_from_every_alternative_of_the_reply_selector() {
+        let selectors = Config::defaults().providers[0].selectors.clone();
+        let selector = browser::reply_selector(&selectors);
+        let alternatives: Vec<&str> = selector.split(',').map(str::trim).collect();
+        assert_eq!(
+            alternatives.len(),
+            selectors.assistant.split(',').count(),
+            "one alternative in, one out: {selector}"
+        );
+        for alternative in &alternatives {
+            assert!(
+                alternative.ends_with(":not(.ds-think-content):not(.ds-think-content *)"),
+                "every alternative must exclude the reasoning block and its contents: {alternative}"
+            );
+        }
+
+        // A provider that renders no reasoning gets its selector back untouched.
+        let mut plain = selectors.clone();
+        plain.reasoning = String::new();
+        assert_eq!(browser::reply_selector(&plain), selectors.assistant);
     }
 
     #[test]
@@ -1692,11 +1709,6 @@ mod tests {
             BridgeOptions {
                 tools: ToolPolicy::default(),
                 start_fresh: true,
-                system_prompt: Arc::from(
-                    DEFAULT_SYSTEM_PROMPT
-                        .replace("{project_dir}", workspace.to_string_lossy().as_ref()),
-                ),
-                forward_system_prompt: false,
             },
         )
         // Record into the real turn log, so `freechatcode turns` can be checked
@@ -2448,15 +2460,17 @@ mod tests {
         ui.shutdown().await;
     }
 
-    /// Live: the model is a Codewhale coder, not a narrator of how it is reached.
+    /// Live: the model is the harness's coder, not a narrator of how it is reached.
     ///
     /// Reported from a real session: the model answered "I'm reached through the
     /// DeepSeek Chat web page, driven in a browser you're signed in to..." and
-    /// recited the session handshake, because the instruction text described the
-    /// wrapper instead of handing over Codewhale's own briefing. This sends the
-    /// same kind of bare message and requires an answer that does not talk about
+    /// recited a session handshake, because the wrapper's instruction text
+    /// described the wrapper instead of handing over the harness's own briefing.
+    /// No instruction text is written by the wrapper any more: the harness's
+    /// messages are the prompt, so the model sees the briefing and nothing else.
+    /// This sends a bare message and requires an answer that does not talk about
     /// its own transport, and it checks the audit to prove the briefing was
-    /// actually bridged.
+    /// actually bridged and that nothing was added around it.
     #[tokio::test]
     #[ignore = "needs a signed-in DeepSeek Chat profile; run with -- --ignored --nocapture"]
     async fn live_the_model_is_a_coder_not_a_narrator_of_its_transport() {
@@ -2465,10 +2479,6 @@ mod tests {
         let (dir, profile) = profile_copy();
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
-        assert!(
-            config.relay.forward_system_prompt,
-            "Codewhale's briefing is what makes this a coder rather than a narrator"
-        );
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
@@ -2535,6 +2545,19 @@ mod tests {
             prompt_seen.contains("BRIEFING-MARKER"),
             "Codewhale's briefing must reach the page"
         );
+        // And nothing else: no wrapper-written preamble, no contract, no reminder.
+        for authored in [
+            "You are a Codewhale coder",
+            "Codewhale request:",
+            "Reminder: prose finishes the turn",
+            "Here is the answer.",
+        ] {
+            assert!(
+                !prompt_seen.contains(authored),
+                "the wrapper wrote its own prompt again ({authored:?}); the prompt must be \
+                 the harness's request and nothing else"
+            );
+        }
 
         // And the answer is about the work, not about the wrapper's plumbing.
         let lower = reply.to_lowercase();
@@ -2554,14 +2577,13 @@ mod tests {
         ui.shutdown().await;
     }
 
-    /// Live: the reported message does not end the turn on a promise.
+    /// Live: the reported message comes back as a delivered reply.
     ///
     /// The input is the user's own, verbatim — not a prompt written to elicit a
     /// tool call, which is what made the first version of this test prove so
-    /// little. A live model is stochastic, so this asserts the *guarantee* the
-    /// relay provides (the turn ends either on an action or on a marked answer,
-    /// never on an unmarked promise) and prints which happened; the deterministic
-    /// guarantee lives in the offline tests for `needs_protocol_retry`.
+    /// little. A live model is stochastic, so this asserts the guarantee the relay
+    /// actually provides — whatever the page says is delivered, parsed and never
+    /// dropped, with no re-ask and no rewriting — and prints what happened.
     #[tokio::test]
     #[ignore = "needs a signed-in DeepSeek Chat profile; run with -- --ignored --nocapture"]
     async fn live_a_chatty_request_does_not_end_the_turn_on_a_promise() {
@@ -2635,19 +2657,17 @@ mod tests {
             .unwrap_or_default();
         let content = message["content"].as_str().unwrap_or_default();
         eprintln!("[loop] finish_reason={finish:?} content={content:?}");
-        // The invariant the mechanism actually provides: the turn does not end on
-        // an unmarked promise. Either the model acted, or it delivered an answer
-        // that the contract marks as one. A live model can still drift, so this
-        // asserts the guarantee rather than a hoped-for behaviour.
+        // The invariant the mechanism provides: the page's reply is delivered.
+        // Either the model acted (a tool call was parsed out of what it wrote) or
+        // it answered in prose, which on this transport *is* the answer. Nothing
+        // is dropped, re-asked or rewritten in between.
         let acted = finish == "tool_calls"
             && message["tool_calls"]
                 .as_array()
                 .is_some_and(|calls| !calls.is_empty());
-        let answered = content.trim_start().starts_with("Here is the answer.");
         assert!(
-            acted || answered,
-            "the turn ended on something that is neither an action nor a marked \
-             answer, which is the failure this pins: finish_reason={finish:?} \
+            acted || !content.trim().is_empty(),
+            "the turn delivered nothing at all: finish_reason={finish:?} \
              content={content:?}"
         );
         ui.shutdown().await;
@@ -4162,5 +4182,111 @@ mod tests {
 
         run.reap();
         eprintln!("[tty] the terminal stayed raw for wrapper {wrapper}");
+    }
+
+    /// Issue #8 and #9 against a real page shape.
+    ///
+    /// DeepSeek with DeepThink on renders the model's reasoning above its answer,
+    /// as markdown inside a `.ds-think-content` panel — DeepSeek's own stylesheet
+    /// says exactly that (`.ds-think-content .ds-markdown { … }`), which is why it
+    /// used to match the `assistant` selector and reach the harness as the model's
+    /// answer. The page here models that shape, with the reasoning appearing
+    /// first and the answer 300 ms later.
+    ///
+    /// The reply must be the answer text, and the reasoning must not appear in
+    /// the reply *or* in a single streamed snapshot.
+    #[tokio::test]
+    async fn the_pages_reasoning_is_never_the_reply() {
+        let playwright = Playwright::launch().await.expect("Playwright driver");
+        let browser = playwright
+            .chromium()
+            .launch()
+            .await
+            .expect("Playwright Chromium");
+        let context = browser.new_context().await.expect("browser context");
+        let page = context.new_page().await.expect("fixture page");
+        page.set_content(
+            r#"<!doctype html><main>
+                <textarea placeholder="Message"></textarea>
+                <button type="submit" aria-label="Send">Send</button>
+              </main>
+              <script>
+                document.querySelector('button[type=submit]').addEventListener('click', () => {
+                  const composer = document.querySelector('textarea');
+                  composer.value = '';
+                  const main = document.querySelector('main');
+                  // The page thinks first: markdown, inside the think panel.
+                  const thinking = document.createElement('div');
+                  thinking.className = 'ds-think-content';
+                  const reasoning = document.createElement('div');
+                  reasoning.className = 'ds-markdown';
+                  reasoning.textContent =
+                    'The user just says "hello, how are you?" This is for asking.';
+                  thinking.append(reasoning);
+                  main.append(thinking);
+                  // Then the answer, which the wrapper must read.
+                  setTimeout(() => {
+                    const answer = document.createElement('div');
+                    answer.className = 'ds-markdown';
+                    answer.textContent = 'Hello! I am doing well.';
+                    main.append(answer);
+                  }, 300);
+                });
+              </script>"#,
+            None,
+        )
+        .await
+        .expect("install local UI fixture");
+
+        let config = Config::defaults();
+        let ui = BrowserChat {
+            spec: BrowserSpec {
+                config: config.clone(),
+                provider: config.providers[0].clone(),
+                url: "https://chat.deepseek.com".to_owned(),
+                profile: PathBuf::from("/nonexistent-test-profile"),
+                cdp_endpoint: None,
+            },
+            session: Mutex::new(Some(
+                Session::new(page.clone(), playwright, context, true)
+                    .await
+                    .expect("session"),
+            )),
+            transport: TransportMode::Gui,
+            api: config.transport.api.clone(),
+            api_timeout: Duration::from_secs(30),
+            keep_alive: true,
+            response_timeout: config.timeouts.response(),
+            model_label: Mutex::new(None),
+            resume_url: Mutex::new(String::new()),
+            last_http_status: Mutex::new(None),
+        };
+
+        let (snapshots, mut seen) = tokio::sync::mpsc::channel::<String>(16);
+        let collected = tokio::spawn(async move {
+            let mut all = Vec::new();
+            while let Some(snapshot) = seen.recv().await {
+                all.push(snapshot);
+            }
+            all
+        });
+
+        let answer = ui
+            .send_streaming("fixture prompt", false, snapshots)
+            .await
+            .expect("visible UI response");
+        ui.shutdown().await;
+        let snapshots = collected.await.expect("snapshot collector");
+
+        assert_eq!(
+            answer, "Hello! I am doing well.",
+            "the reply must be the page's answer, never its reasoning"
+        );
+        for snapshot in &snapshots {
+            assert!(
+                !snapshot.contains("The user just says"),
+                "the page's reasoning reached the stream: {snapshot:?}"
+            );
+        }
     }
 }

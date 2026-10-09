@@ -11,6 +11,22 @@ What FreeChatCode can do, what was verified, and what was not. Last updated
 > below remains valid for the DeepSeek provider, which is now one
 > `[[providers]]` entry rather than the whole project.
 
+> **Delivery note (2026-10-09):** the wrapper no longer writes a prompt and no
+> longer owns a reply format. `assets/system-prompt.md` is deleted, along with the
+> `Here is the answer.` contract, the protocol re-ask, `[codewhale] system_prompt`
+> and `[relay] forward_system_prompt`: the harness's messages (and its declared
+> tools) are the request, verbatim, and whatever the page says is what the harness
+> gets. Two observed failures drove it — a harness that titles a session from its
+> reply titled it `Here is the answer.`, and with DeepThink on the page's own
+> *reasoning* reached the harness as the answer (issues #8, #9). The reasoning is
+> now excluded by selector — `.ds-think-content`, which DeepSeek's own stylesheet
+> styles as `.ds-think-content .ds-markdown { … }` — so it is never read as the
+> reply and never streamed; it is ignored, not translated. Everything below that
+> describes the instruction text, the contract, the marker or the re-ask is the
+> record **before** this change, left as it was measured. Current offline gate:
+> `cargo test --locked` — 56 lib + 24 bin passing, 0 failing, 20 live tests
+> ignored by default.
+
 The short version: the bridge works end to end. A real `codewhale` 0.10.0
 process was driven through the local relay, the browser, and the live DeepSeek
 Chat page, and printed its answer. Every core criterion below was exercised

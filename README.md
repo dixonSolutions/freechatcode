@@ -327,6 +327,7 @@ routed_url_pattern = "/a/chat/s/"
 [providers.selectors]
 composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
 assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
+reasoning = ".ds-think-content"          # excluded from every read of the reply
 send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
 new_chat = "button[aria-label*='new chat' i]"
 thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
@@ -345,7 +346,8 @@ toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = true 
 
 `[[providers.models]]` declares what `/v1/models` advertises; a model's `toggles`
 are the page controls engaged before a turn (and read back after). The selectors
-were read off the live page, not guessed. Every provider runs as its own tab in
+were read off the live page, not guessed — `reasoning` in particular, which names
+the page's own thinking block so it is never mistaken for the model's answer. Every provider runs as its own tab in
 one relay, so `--model gemini-flash` and `--model deepseek-pro` both work in the
 same session.
 
@@ -421,25 +423,32 @@ than retried.
 If the whole wrapper is restarted, the conversation is still found: the
 session→conversation link lives in `~/.codewhale/freechatcode/sessions.db`.
 
-### The instruction text
+### The prompt
 
-The text sent ahead of every request is not hardcoded. It lives in
-`assets/system-prompt.md`, committed and embedded, and you can point at your own
-file instead:
+There is no wrapper-written prompt. The request body the harness sends — its
+system message, its conversation, its declared tools — is handed to the chat page
+as-is:
 
-```toml
-[codewhale]
-system_prompt = "/home/you/.config/freechatcode/system-prompt.md"
+```json
+{"messages":[…],"tools":[…],"tool_choice":…}
 ```
 
-`{project_dir}` and `{payload}` are filled at runtime. If your file has no
-`{payload}`, the request is appended after it.
+Nothing is prepended, appended or reworded. The harness already describes itself,
+its workspace and its tools; a wrapper-authored preamble is the wrapper speaking
+as the model, and a real session answered by reciting that preamble back. If a
+model needs a different framing, that belongs in the harness's own prompt.
 
-Codewhale's own system message — the whole project briefing — is forwarded into
-the chat by default, because that briefing is the model's context: the workspace,
-the project rules, the tools. The file above is only the transport contract (reply
-with prose, or with a tool-calls object). Set `[relay] forward_system_prompt =
-false` to drop the briefing and send a smaller prompt.
+The page's own reasoning is not part of the reply. Chat UIs that render the
+model's thinking above the answer (DeepSeek with DeepThink on) expose it in the
+transcript, and it is excluded by selector:
+
+```toml
+[providers.selectors]
+assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
+reasoning = ".ds-think-content"   # never read as the reply, never streamed
+```
+
+Set `reasoning = ""` for a page that renders none.
 
 ## Session linking and the turn log
 

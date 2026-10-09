@@ -42,9 +42,6 @@ use uuid::Uuid;
 /// there is no per-token bill to report. Everything the wrapper is asked about
 /// pricing returns this, so a caller never has to render "unknown".
 pub const PRICING_LABEL: &str = "Unlimited Chat!";
-/// The instruction text handed to the chat model. Committed and embedded in the
-/// binary; override the path with `[codewhale] system_prompt` in config.
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../assets/system-prompt.md");
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
 /// How often a keep-alive comment is written while the browser turn runs.
@@ -242,28 +239,11 @@ impl ToolPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BridgeOptions {
     pub tools: ToolPolicy,
     /// Ask the browser for a brand-new conversation on the first turn.
     pub start_fresh: bool,
-    /// Instruction text sent ahead of each request. `{payload}` marks where the
-    /// Codewhale request JSON goes.
-    pub system_prompt: Arc<str>,
-    /// Forward Codewhale's own system message. Off by default: it carries the
-    /// whole project briefing, which the instruction text replaces.
-    pub forward_system_prompt: bool,
-}
-
-impl Default for BridgeOptions {
-    fn default() -> Self {
-        Self {
-            tools: ToolPolicy::default(),
-            start_fresh: false,
-            system_prompt: Arc::from(DEFAULT_SYSTEM_PROMPT),
-            forward_system_prompt: true,
-        }
-    }
 }
 
 /// One model the relay serves: its id, the provider it belongs to, and the page
@@ -679,35 +659,14 @@ fn streamed_body(writer: &SseWriter, assistant: &Value, streamed: &str) -> Strin
     body
 }
 
-/// The marker the delivery contract requires at the start of a final answer.
-const FINAL_ANSWER_MARKER: &str = "Here is the answer.";
-
-/// The nudge sent when a reply arrived in neither required form.
-const PROTOCOL_REPAIR: &str = "Your previous reply was neither the tool_calls JSON \
-object nor a final answer starting with \"Here is the answer.\", so it was not \
-delivered and the turn stopped. Reply again, in one of those two forms only — if \
-you meant to use a tool, reply with the JSON object now.";
-
-/// Whether a reply failed the delivery contract badly enough to re-ask.
-///
-/// Only on a turn that supplied tools (without them prose *is* the answer), and
-/// only when the reply carries neither a tool-call envelope nor the final-answer
-/// marker. Anything that is one or the other is accepted, however short: the
-/// point is not to police style, it is to stop a turn from ending on a sentence
-/// like "Let me look."
-fn needs_protocol_retry(raw: &str, tools: Option<&[Value]>) -> bool {
-    let supplied_tools = tools.is_some_and(|tools| !tools.is_empty());
-    if !supplied_tools {
-        return false;
-    }
-    let text = raw.trim();
-    if text.is_empty() || text.starts_with('{') || text.starts_with("```") {
-        // An envelope attempt, well-formed or not — the parser's problem, not
-        // something a second ask fixes.
-        return false;
-    }
-    !text.starts_with(FINAL_ANSWER_MARKER)
-}
+// The delivery contract, and its marker, used to live here: the wrapper asked the
+// page for either a `tool_calls` JSON object or prose opening with
+// `Here is the answer.`, and treated anything else as a protocol failure to
+// re-ask. It is gone. The wrapper is a transport — messages in, text out — and a
+// transport does not invent a reply format, police the model's phrasing, or ship
+// its own framing inside the answer (that line reached the user, and a harness
+// that titles a session from its reply titled it `Here is the answer.`). What the
+// page's model says is what the harness gets.
 
 /// Run one relay turn end to end: replay, prepare, drive the browser, and parse
 /// the reply. Errors carry the HTTP status the non-streaming path should use.
@@ -762,38 +721,7 @@ async fn relay_turn(
         Some(snapshots) => route.ui.send_streaming(&prompt, reset, snapshots).await,
         None => route.ui.send(&prompt, reset).await,
     } {
-        Ok(raw) => {
-            // A reply that is neither a tool call nor a marked final answer is the
-            // delivery contract failing, not the model answering. On this
-            // transport prose IS a final answer, so "I want to check two things
-            // ... Let me look." ended Codewhale's loop with nothing done and no
-            // error anywhere. Ask once more rather than let a sentence close a
-            // turn; whatever the second reply is, it is delivered either way, so
-            // this can cost a round trip and never an answer.
-            if !needs_protocol_retry(&raw, request.tools.as_deref()) {
-                raw
-            } else {
-                let repair = format!("{prompt}\n\n{PROTOCOL_REPAIR}");
-                eprintln!(
-                    "freechatcode: the reply was neither a tool call nor a marked final \
-                     answer; asking once more instead of ending the turn on it"
-                );
-                let _ = state
-                    .audit
-                    .append(json!({
-                        "kind": "retry",
-                        "request_id": request_id.clone(),
-                        "reason": "reply was neither a tool call nor a marked final answer",
-                        "browser_response": raw.clone(),
-                    }))
-                    .await;
-                match route.ui.send(&repair, false).await {
-                    Ok(retry) => retry,
-                    // The first reply is all there is. Better delivered than lost.
-                    Err(_) => raw,
-                }
-            }
-        }
+        Ok(raw) => raw,
         Err(error) => {
             // Never swallow this: the reason a turn died is otherwise invisible.
             eprintln!("freechatcode: browser relay failed: {error}");
@@ -999,21 +927,13 @@ impl ConversationRelay {
         } else {
             tail_start(&request.messages)
         };
-        let delta: Vec<Value> = {
-            let window = &request.messages[start..];
-            if options.forward_system_prompt {
-                window.to_vec()
-            } else {
-                // Codewhale's system message is the full project briefing. The
-                // instruction text already identifies the session, so it is
-                // dropped rather than re-explained to the model.
-                window
-                    .iter()
-                    .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
-                    .cloned()
-                    .collect()
-            }
-        };
+        // The harness's messages go to the page verbatim. The wrapper injects no
+        // instruction text of its own: the harness already describes itself, its
+        // tools and its workspace in its system message, and a wrapper-authored
+        // preamble is the wrapper speaking as the model (it has been recited back
+        // to the user as an answer). The only thing this layer decides is *where*
+        // the message goes — the window below — not what it says.
+        let delta: Vec<Value> = request.messages[start..].to_vec();
         let include_tools = reset || self.previous_tools.as_ref() != request.tools.as_ref();
         // Only the selected subset of Codewhale's catalog is embedded, so the
         // chat prompt does not carry every tool schema.
@@ -1030,13 +950,8 @@ impl ConversationRelay {
             "tool_choice": tool_choice,
         })
         .to_string();
-        // The instruction text lives in assets/system-prompt.md (or a path from
-        // config), never in code. `{payload}` marks where the request lands.
-        let prompt = if options.system_prompt.contains("{payload}") {
-            options.system_prompt.replace("{payload}", &payload)
-        } else {
-            format!("{}\n\nCodewhale request:\n{payload}", options.system_prompt)
-        };
+        // The prompt *is* the request: no preamble, no reminder, no contract.
+        let prompt = payload;
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err("browser prompt exceeds the 4 MiB relay limit".into());
         }
@@ -1648,22 +1563,22 @@ mod tests {
         assert!(prompt.contains("NEW-TURN"));
     }
 
-    /// The failing case, reproduced without a model: a reply that promises to act
-    /// is re-asked instead of being delivered as a final answer.
+    /// The page's prose is the answer, delivered verbatim, once.
     ///
-    /// This is the reported text verbatim. On this transport prose ends the turn,
-    /// so before this the loop stopped with nothing done and no error.
+    /// This is the reported text verbatim — a reply that promises to act. It used
+    /// to be treated as a protocol failure and re-asked. It is now simply what the
+    /// model said: the wrapper does not police phrasing, does not re-ask, and does
+    /// not rewrite the reply. Prose ends the turn because prose *is* the answer on
+    /// this transport (see `docs/design.md`).
     #[tokio::test]
-    async fn a_promise_to_act_is_re_asked_instead_of_ending_the_turn() {
+    async fn the_pages_prose_is_delivered_verbatim_without_a_re_ask() {
         install_crypto_provider();
+        let promise = "I want to check two things before I give you a straight opinion: \
+                       the repo's own naming footprint, and whether Gemini has any \
+                       API-level support. Let me look."
+            .to_owned();
         let ui = Arc::new(FakeUi {
-            replies: StdMutex::new(vec![
-                "I want to check two things before I give you a straight opinion: the repo's \
-                 own naming footprint, and whether Gemini has any API-level support. Let me look."
-                    .to_owned(),
-                r#"{"type":"tool_calls","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"README.md"}}}]}"#
-                    .to_owned(),
-            ]),
+            replies: StdMutex::new(vec![promise.clone()]),
             prompts: StdMutex::new(Vec::new()),
         });
         let state = ServerState::new("secret", ui.clone(), Arc::new(FakeAudit));
@@ -1681,27 +1596,23 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await.expect("completion json");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(
-            body["choices"][0]["finish_reason"], "tool_calls",
-            "a promise to act must not end the turn: {body}"
+            body["choices"][0]["message"]["content"],
+            json!(promise),
+            "the wrapper must not rewrite or re-ask the model's words: {body}"
         );
         assert_eq!(
-            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            "read_file"
+            ui.prompts.lock().expect("prompts lock").len(),
+            1,
+            "exactly one request, no protocol re-ask"
         );
-
-        let prompts = ui.prompts.lock().expect("prompts lock").clone();
-        assert_eq!(prompts.len(), 2, "exactly one re-ask, not a loop");
-        assert!(
-            prompts[1].0.contains("neither the tool_calls JSON object"),
-            "the re-ask must say what was wrong: {}",
-            prompts[1].0
-        );
-        assert!(!prompts[1].1, "the re-ask continues the same conversation");
     }
 
+    /// Whatever the page says is what the harness gets: no marker is special any
+    /// more, and nothing is stripped from the reply.
     #[tokio::test]
-    async fn a_marked_final_answer_is_delivered_without_a_re_ask() {
+    async fn a_reply_is_carried_through_unchanged() {
         install_crypto_provider();
         let ui = Arc::new(FakeUi {
             replies: StdMutex::new(vec!["Here is the answer.\n\nIt is a bridge.".to_owned()]),
@@ -1721,60 +1632,11 @@ mod tests {
         .await;
         let body: Value = response.json().await.expect("completion json");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
-        assert_eq!(ui.prompts.lock().expect("prompts lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_retry_that_fails_again_is_delivered_rather_than_lost() {
-        install_crypto_provider();
-        let ui = Arc::new(FakeUi {
-            replies: StdMutex::new(vec![
-                "Let me look.".to_owned(),
-                "Second try, still not in either form.".to_owned(),
-            ]),
-            prompts: StdMutex::new(Vec::new()),
-        });
-        let state = ServerState::new("secret", ui.clone(), Arc::new(FakeAudit));
-        let address = serve(state).await;
-        let response = post(
-            address,
-            "secret",
-            &request(
-                vec![json!({"role":"user","content":"what is this?"})],
-                false,
-            ),
-            None,
-        )
-        .await;
-        let body: Value = response.json().await.expect("completion json");
-        // Bounded: one re-ask, then whatever came back is the answer.
-        assert_eq!(ui.prompts.lock().expect("prompts lock").len(), 2);
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
-        assert!(
-            body["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Second try"),
-            "the second reply is delivered, never dropped: {body}"
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "Here is the answer.\n\nIt is a bridge."
         );
-    }
-
-    #[test]
-    fn the_re_ask_rule_only_fires_on_a_turn_that_supplied_tools() {
-        let tools = vec![json!({"type":"function","function":{"name":"read_file"}})];
-        // The reported failure: prose that promises action, with tools on offer.
-        assert!(needs_protocol_retry("Let me look.", Some(&tools)));
-        // A marked answer is a final answer, whatever else it says.
-        assert!(!needs_protocol_retry(
-            "Here is the answer.\n\nDone.",
-            Some(&tools)
-        ));
-        // An envelope attempt is the parser's business, not the nudge's.
-        assert!(!needs_protocol_retry("{not json at all", Some(&tools)));
-        // No tools supplied: prose *is* the answer.
-        assert!(!needs_protocol_retry("Let me look.", None));
-        assert!(!needs_protocol_retry("Let me look.", Some(&[])));
-        assert!(!needs_protocol_retry("", Some(&tools)));
+        assert_eq!(ui.prompts.lock().expect("prompts lock").len(), 1);
     }
 
     #[test]
@@ -1870,19 +1732,14 @@ mod tests {
         assert!(prompt.contains("USER-MARKER"));
         assert!(
             prompt.contains("PROJECT-BRIEFING-MARKER"),
-            "Codewhale's system briefing must be forwarded by default"
+            "the harness's own system briefing is the prompt: it is forwarded verbatim"
         );
-
-        // Still droppable, for a smaller prompt: the option is a switch, not a
-        // removal.
-        let dropping = BridgeOptions {
-            forward_system_prompt: false,
-            ..BridgeOptions::default()
-        };
-        let relay = ConversationRelay::new(false);
-        let (prompt, _) = relay.prepare(&request, &dropping).expect("prepare");
-        assert!(prompt.contains("USER-MARKER"));
-        assert!(!prompt.contains("PROJECT-BRIEFING-MARKER"));
+        // And nothing is added around it: the prompt *is* the request JSON, so a
+        // wrapper-authored preamble cannot be mistaken for an instruction.
+        assert!(
+            prompt.trim_start().starts_with('{') && prompt.trim_end().ends_with('}'),
+            "the prompt must be the request and nothing else: {prompt}"
+        );
     }
 
     struct SlowUi {
@@ -2026,7 +1883,35 @@ mod tests {
                 let _ = snapshots.send(partial.to_owned()).await;
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            Ok(r#"{"type":"final","content":"Hello world"}"#.to_owned())
+            Ok("Hello world".to_owned())
+        }
+
+        async fn model_label(&self) -> Option<String> {
+            Some("DeepSeek-V4".to_owned())
+        }
+    }
+
+    /// A page whose model answered in plain prose. Nothing about it is special:
+    /// the wrapper has no contract to hold it to.
+    struct ProseUi;
+
+    #[async_trait]
+    impl ChatUi for ProseUi {
+        async fn send(&self, _prompt: &str, _start_new_chat: bool) -> Result<String, String> {
+            unreachable!("the streaming path is always used")
+        }
+
+        async fn send_streaming(
+            &self,
+            _prompt: &str,
+            _start_new_chat: bool,
+            snapshots: tokio::sync::mpsc::Sender<String>,
+        ) -> Result<String, String> {
+            for partial in ["Let me", "Let me look at the repo"] {
+                let _ = snapshots.send(partial.to_owned()).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok("Let me look at the repo".to_owned())
         }
 
         async fn model_label(&self) -> Option<String> {
@@ -2072,6 +1957,46 @@ mod tests {
         assert_eq!(
             body.matches(r#""content":"Hello world""#).count(),
             0,
+            "body was {body}"
+        );
+        server.abort();
+    }
+
+    /// Plain prose streams as it is written, with nothing asked for and nothing
+    /// added: the page's words, in order, once.
+    #[tokio::test]
+    async fn plain_prose_streams_as_deltas_and_is_not_repeated() {
+        install_crypto_provider();
+        let state = ServerState::new("secret", Arc::new(ProseUi), Arc::new(FakeAudit));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.expect("serve");
+        });
+
+        let completion = request(vec![json!({"role":"user","content":"hi"})], true);
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth("secret")
+            .json(&completion)
+            .send()
+            .await
+            .expect("streaming response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("stream body");
+        let first = body.find(r#""content":"Let me""#).expect("first delta");
+        let second = body
+            .find(r#""content":" look at the repo""#)
+            .expect("second delta");
+        assert!(first < second, "deltas must arrive in order: {body}");
+        assert!(
+            !body.contains(r#""content":"Let me look at the repo""#),
+            "the whole answer must not be sent again after the deltas: {body}"
+        );
+        assert!(
+            body.contains(r#""finish_reason":"stop""#),
             "body was {body}"
         );
         server.abort();

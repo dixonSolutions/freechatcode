@@ -739,7 +739,7 @@ impl BrowserChat {
         // last element rather than the whole transcript is what keeps this
         // cheap: pulling every assistant message on every poll is what made the
         // first turn feel stalled.
-        let assistants = page.locator(&self.selectors().assistant);
+        let assistants = page.locator(reply_selector(self.selectors()));
         let previous_count = assistants
             .count()
             .await
@@ -1113,6 +1113,34 @@ pub(crate) fn reply_arrived(
     // A count that *shrank* is not evidence of a new reply — the window shifted.
     // A text that changed is: the newest message is always the mounted last one.
     count > previous_count || text != previous_text
+}
+
+/// The selector the reply is read from: the assistant block, with the page's
+/// own **reasoning** excluded.
+///
+/// On DeepSeek with DeepThink on, the reasoning is rendered as markdown inside a
+/// `.ds-think-content` panel that sits above the answer, in the same transcript
+/// the `assistant` selector matches (DeepSeek's own stylesheet says so:
+/// `.ds-think-content .ds-markdown { … }`). Reading the newest match without this
+/// exclusion hands the harness the page's thinking as the model's answer, and
+/// turns a harness session title into the first line of that thinking.
+///
+/// The reasoning is not part of what the wrapper delivers: it is ignored, not
+/// translated (a harness that wants thinking has its own channel for it, and this
+/// text is the page's readout of a model the harness did not call). The
+/// exclusion is applied to every alternative in the selector list, so a
+/// comma-separated `assistant` keeps working.
+pub(crate) fn reply_selector(selectors: &Selectors) -> String {
+    let assistant = selectors.assistant.trim();
+    let reasoning = selectors.reasoning.trim();
+    if reasoning.is_empty() {
+        return assistant.to_owned();
+    }
+    assistant
+        .split(',')
+        .map(|one| format!("{}:not({reasoning}):not({reasoning} *)", one.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Classify a browser-level network error from its Chromium code.

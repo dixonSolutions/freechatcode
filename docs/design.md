@@ -40,6 +40,19 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
   wherever the model wrote it, fenced or trailing or after its own reasoning —
   and normalised to the OpenAI shape. The model's words are otherwise carried
   through unchanged.
+- **The prompt is the harness's, verbatim.** The wrapper writes no instruction
+  text of its own: no preamble describing the transport, no contract the model
+  has to satisfy, no reminder. The harness's messages (and its declared tools)
+  are the request. A wrapper-authored prompt is the wrapper speaking as the
+  model, and it has been answered as if it were an instruction and recited back
+  to the user as an answer.
+- **The page's reasoning is not the reply.** When the page renders its own
+  thinking above the answer, that block is excluded from every read (and so from
+  everything streamed): it is the page's readout of a model the harness did not
+  call. It is ignored rather than translated — a harness that wants thinking has
+  its own channel for it — and it is configured per provider
+  (`[providers.selectors] reasoning`), because it is a property of the page, not
+  a convention the model can be asked to follow.
 - **The wire *shape* is enforced; the tool *set* is not.** A call with no
   function name, or arguments that are not a JSON object, is refused: no harness
   can act on it. A call naming a tool the request did not declare is **carried**,
@@ -60,8 +73,8 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
 
 ## What the wrapper deliberately does not do
 
-- **It does not decide the loop.** Prose ends the turn *because the contract says
-  prose is a final answer*, not because the wrapper judged the work finished.
+- **It does not decide the loop.** Prose ends the turn *because prose is a final
+  answer on this transport*, not because the wrapper judged the work finished.
 - **It does not lecture the model about itself.** No paragraph explaining how the
   session is reached: a real session answered the user by reciting exactly that
   paragraph instead of doing the work.
@@ -94,11 +107,13 @@ OpenAI dialect can be pointed at it; the thread is the page's, so a long
 conversation is free to continue; and the wrapper has no opinion to be wrong
 about.
 
-Cost, stated plainly: when the model writes "Let me look." and marks it as its
-final answer, the turn ends. That is a model behaviour the wrapper carries
-rather than corrects. The contract tells the model not to (see
-`assets/system-prompt.md`), and that is the whole of the mechanism — a heuristic
-here would be the wrapper inventing intent.
+Cost, stated plainly: when the model writes "Let me look." the turn ends and
+that sentence is the answer. That is a model behaviour the wrapper carries rather
+than corrects — and now it is not even nudged: the wrapper no longer asks for a
+tool-call shape, no longer asks for prose to be marked, and no longer re-asks when
+a reply looks like a promise. A heuristic there would be the wrapper inventing
+intent, and a *prompt* there was the wrapper injecting it. Both are gone; what the
+page says is what the harness gets.
 
 ## Evidence
 
