@@ -44,7 +44,7 @@ struct Args {
     #[arg(long)]
     cdp_endpoint: Option<String>,
 
-    /// DeepSeek Chat page to open (defaults to the configured chat URL).
+    /// Chat page to open (defaults to the configured chat URL).
     #[arg(long)]
     chat_url: Option<String>,
 
@@ -77,20 +77,20 @@ struct Args {
     #[arg(long, value_enum)]
     mode: Option<RunMode>,
 
-    /// Model to launch Codewhale with. Defaults to the chat model.
+    /// Model to launch the harness with. Defaults to the chat model.
     #[arg(long)]
     model: Option<String>,
 
-    /// Arguments passed unchanged to Codewhale after `--`.
-    #[arg(last = true)]
+    /// Arguments passed unchanged to the harness after `--`.
+    #[arg(last = true, value_name = "HARNESS_ARGS")]
     codewhale_args: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Check health of codewhale binary, relay, and browser.
+    /// Check the harness binary, the relay, and the browser.
     Health,
-    /// Install codewhale-cli via cargo.
+    /// Install the Codewhale CLI (the default harness) via cargo.
     Install,
     /// Show the pre-flight TUI, then run the bridge.
     Tui,
@@ -106,12 +106,12 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// Find (and remember) the codewhale binary, then run the bridge.
+    /// Find (and remember) the harness binary, then run the bridge.
     Launch {
-        /// Optional codewhale executable name or path to track down.
+        /// Optional harness executable name or path to track down.
         binary: Option<String>,
-        /// Arguments passed unchanged to Codewhale after `--`.
-        #[arg(last = true)]
+        /// Arguments passed unchanged to the harness after `--`.
+        #[arg(last = true, value_name = "HARNESS_ARGS")]
         codewhale_args: Vec<OsString>,
     },
 }
@@ -570,10 +570,18 @@ impl Drop for ScreenHandover {
 
 /// One-time move of the first release's DeepSeek profile/audit directory into
 /// the per-provider layout, so a signed-in browser session is not lost.
+///
+/// This must run before *any* subcommand that can touch a provider directory.
+/// A subcommand that created `providers/<id>/` first made the migration skip
+/// itself, which stranded the only signed-in browser profile under the legacy
+/// name and left the wrapper looking logged out.
 fn migrate_provider_dirs(home: &Path) {
     let legacy = home.join("deepseek-chat");
     let current = home.join("providers").join("deepseek");
-    if legacy.exists() && !current.exists() {
+    if !legacy.exists() {
+        return;
+    }
+    if !current.exists() {
         if let Some(parent) = current.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -584,7 +592,27 @@ fn migrate_provider_dirs(home: &Path) {
                 current.display()
             );
         }
+        return;
     }
+    // The destination already exists. Move each piece it does not have instead
+    // of skipping the whole directory, so an early-created (empty) provider dir
+    // cannot strand a signed-in profile or its audit history.
+    for name in ["browser", "audit"] {
+        let (from, to) = (legacy.join(name), current.join(name));
+        if from.exists()
+            && !to.exists()
+            && let Err(error) = std::fs::rename(&from, &to)
+        {
+            eprintln!(
+                "freechatcode: could not migrate {} to {}: {error}",
+                from.display(),
+                to.display()
+            );
+        }
+    }
+    // `remove_dir` only succeeds once the legacy directory is empty, so this
+    // never discards anything the loop above could not move.
+    let _ = std::fs::remove_dir(&legacy);
 }
 
 /// Check each configured (or the one named) provider: can a browser open, and is
@@ -677,6 +705,10 @@ async fn set_private_file(path: &Path) -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    // Resolve the home and run the one-time directory migration *before* any
+    // subcommand can create a provider directory of its own.
+    let home = default_home()?;
+    migrate_provider_dirs(&home);
 
     let (binary_hint, codewhale_args) = match args.command {
         Some(Commands::Health) => {
@@ -693,11 +725,10 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Turns { limit }) => {
-            print_turns(&default_home()?, limit)?;
+            print_turns(&home, limit)?;
             return Ok(());
         }
         Some(Commands::Doctor { provider }) => {
-            let home = default_home()?;
             let config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
                 .map_err(|error| anyhow::anyhow!(error))?;
             run_doctor(&config, &home, provider.as_deref()).await?;
@@ -714,8 +745,6 @@ async fn run() -> Result<()> {
         None => (None, args.codewhale_args.clone()),
     };
 
-    let home = default_home()?;
-    migrate_provider_dirs(&home);
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -1206,12 +1235,101 @@ mod tests {
         assert!(!reply_arrived(2, "previous", 3, "   "));
     }
 
+    /// The managed browser profile the runtime would use for the shipped
+    /// provider, derived through `make_browser` rather than written out — so a
+    /// test cannot point at a directory the wrapper stopped using.
+    fn provider_profile(home: &Path) -> PathBuf {
+        let config = Config::load(Some(&config::user_config_path(home))).expect("config");
+        let provider = config.providers.first().expect("a configured provider");
+        make_browser(
+            &config,
+            provider,
+            home,
+            None,
+            None,
+            provider.chat.url.clone(),
+        )
+        .spec
+        .profile
+    }
+
     #[test]
-    fn wrapper_never_defaults_to_the_users_normal_chrome_profile() {
-        let default = default_home()
-            .expect("Codewhale home")
-            .join("deepseek-chat/browser");
-        assert!(default.ends_with("deepseek-chat/browser"));
+    fn the_managed_profile_belongs_to_the_provider_under_the_codewhale_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let profile = provider_profile(home.path());
+
+        assert_eq!(
+            profile,
+            home.path()
+                .join("providers")
+                .join("deepseek")
+                .join("browser"),
+            "the profile lives under the provider, in the Codewhale home"
+        );
+        assert!(
+            profile.starts_with(home.path()),
+            "the managed browser is never the user's everyday Chromium profile"
+        );
+    }
+
+    #[test]
+    fn migration_still_runs_when_the_provider_directory_already_exists() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path();
+        // The first release kept the signed-in profile and its audit log under
+        // `deepseek-chat/`.
+        let legacy = home.join("deepseek-chat");
+        std::fs::create_dir_all(legacy.join("browser").join("Default")).expect("legacy profile");
+        std::fs::write(
+            legacy.join("browser").join("Default").join("Cookies"),
+            b"signed-in",
+        )
+        .expect("write cookie");
+        std::fs::create_dir_all(legacy.join("audit")).expect("legacy audit");
+        // A subcommand created the per-provider directory first, and left it
+        // empty. This is what used to make the migration skip itself and strand
+        // the only signed-in profile under the legacy name.
+        std::fs::create_dir_all(home.join("providers").join("deepseek")).expect("provider dir");
+
+        migrate_provider_dirs(home);
+
+        let current = home.join("providers").join("deepseek");
+        assert!(
+            current
+                .join("browser")
+                .join("Default")
+                .join("Cookies")
+                .exists(),
+            "a signed-in profile must not be stranded in the legacy directory"
+        );
+        assert!(
+            current.join("audit").exists(),
+            "the audit history moves too"
+        );
+        assert!(!legacy.exists(), "the emptied legacy directory is removed");
+    }
+
+    #[test]
+    fn migration_never_clobbers_a_profile_already_in_the_new_layout() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path();
+        let legacy = home.join("deepseek-chat").join("browser");
+        std::fs::create_dir_all(&legacy).expect("legacy profile");
+        std::fs::write(legacy.join("legacy-cookie"), b"old").expect("write");
+        let current = home.join("providers").join("deepseek").join("browser");
+        std::fs::create_dir_all(&current).expect("current profile");
+        std::fs::write(current.join("current-cookie"), b"new").expect("write");
+
+        migrate_provider_dirs(home);
+
+        assert!(
+            current.join("current-cookie").exists(),
+            "the profile in the new layout is left alone"
+        );
+        assert!(
+            legacy.join("legacy-cookie").exists(),
+            "and the other one is left in place, never deleted"
+        );
     }
 
     #[test]
@@ -1552,7 +1670,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -1692,7 +1810,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -2767,7 +2885,7 @@ mod tests {
     /// for the profile a real session is using.
     fn profile_copy() -> (tempfile::TempDir, PathBuf) {
         let home = default_home().expect("codewhale home");
-        let source = home.join("deepseek-chat").join("browser");
+        let source = provider_profile(&home);
         let dir = tempfile::tempdir().expect("tempdir");
         let profile = dir.path().join("browser-copy");
         assert!(
@@ -2910,7 +3028,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: Some("http://127.0.0.1:9222".to_owned()),
             },
             session: Mutex::new(None),
@@ -3142,7 +3260,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
 
-        let source = home.join("deepseek-chat").join("browser");
+        let source = provider_profile(&home);
         let dir = tempfile::tempdir().expect("tempdir");
         let profile = dir.path().join("browser-copy");
         let copied = std::process::Command::new("cp")
@@ -3495,7 +3613,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: linked.unwrap_or_else(|| config.providers[0].chat.url.clone()),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -3567,7 +3685,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: conversation.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),

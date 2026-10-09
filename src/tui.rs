@@ -138,7 +138,7 @@ fn draw_header(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " — DeepSeek Chat bridge for Codewhale",
+            " — coding agents over free chat web UIs",
             Style::default().fg(Color::DarkGray),
         ),
     ]))
@@ -150,8 +150,8 @@ fn draw_status(frame: &mut Frame, area: Rect, health: Option<&HealthReport>) {
     let codewhale_status = health
         .as_ref()
         .and_then(|h| h.codewhale_binary.as_ref())
-        .map(|b| format!("codewhale: {}", b))
-        .unwrap_or_else(|| "codewhale: not found".to_string());
+        .map(|b| format!("harness: {}", b))
+        .unwrap_or_else(|| "harness: not found".to_string());
 
     let version = health
         .as_ref()

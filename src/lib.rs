@@ -1,4 +1,4 @@
-//! FreeChatCode — DeepSeek Chat browser relay for Codewhale.
+//! FreeChatCode — run coding agents through free chat web UIs.
 //!
 //! This crate exposes a short-lived loopback OpenAI-compatible endpoint and
 //! relays each completion through the visible DeepSeek Chat page with
