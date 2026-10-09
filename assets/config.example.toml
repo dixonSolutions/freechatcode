@@ -1,6 +1,6 @@
-# Example user config for DeepChatCode.
+# Example user config for FreeChatCode.
 #
-# Copy to ~/.codewhale/deepchatcode/config.toml (or $CODEWHALE_HOME/deepchatcode/
+# Copy to ~/.codewhale/freechatcode/config.toml (or $CODEWHALE_HOME/freechatcode/
 # config.toml) and edit. Every key is optional: anything you leave out keeps the
 # compiled-in default from assets/config.default.toml.
 #
@@ -15,7 +15,7 @@ binary = "/home/you/.cargo/bin/codewhale"
 # `{project_dir}` placeholder is filled from the working directory and
 # `{payload}` marks where the Codewhale request JSON goes. When unset, the
 # committed assets/system-prompt.md embedded in the binary is used.
-# system_prompt = "/home/you/.config/deepchatcode/system-prompt.md"
+# system_prompt = "/home/you/.config/freechatcode/system-prompt.md"
 
 # Browser settings. All of these are machine-specific.
 [browser]
@@ -63,7 +63,7 @@ binary = "/home/you/.cargo/bin/codewhale"
 # search_toggle = "button[aria-label*='search' i]"
 # thinking_toggle = "button[aria-label*='think' i]"
 # file_upload = "input[type='file']"
-# Element naming the model in use, so `deepchatcode turns` can attribute a
+# Element naming the model in use, so `freechatcode turns` can attribute a
 # reply to a model. Empty (the default) records it as unknown.
 # model_label = "[data-testid*='model' i]"
 

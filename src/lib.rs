@@ -1,4 +1,4 @@
-//! DeepChatCode — DeepSeek Chat browser relay for Codewhale.
+//! FreeChatCode — DeepSeek Chat browser relay for Codewhale.
 //!
 //! This crate exposes a short-lived loopback OpenAI-compatible endpoint and
 //! relays each completion through the visible DeepSeek Chat page with
@@ -319,7 +319,7 @@ impl ServerState {
     /// the log is unwritable.
     async fn record(&self, turn: TurnRecord) {
         if let Err(error) = self.turns.record(turn).await {
-            eprintln!("deepchatcode: could not record the turn: {error}");
+            eprintln!("freechatcode: could not record the turn: {error}");
         }
     }
 
@@ -692,7 +692,7 @@ async fn relay_turn(
             } else {
                 let repair = format!("{prompt}\n\n{PROTOCOL_REPAIR}");
                 eprintln!(
-                    "deepchatcode: the reply was neither a tool call nor a marked final \
+                    "freechatcode: the reply was neither a tool call nor a marked final \
                      answer; asking once more instead of ending the turn on it"
                 );
                 let _ = state
@@ -713,7 +713,7 @@ async fn relay_turn(
         }
         Err(error) => {
             // Never swallow this: the reason a turn died is otherwise invisible.
-            eprintln!("deepchatcode: browser relay failed: {error}");
+            eprintln!("freechatcode: browser relay failed: {error}");
             // Ask the transport what actually happened before blaming anyone: a
             // dead uplink is not the chat service's fault.
             let failure = match state.ui.diagnose(&error).await {

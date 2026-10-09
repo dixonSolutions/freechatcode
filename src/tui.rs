@@ -132,7 +132,7 @@ fn draw_frame(
 fn draw_header(frame: &mut Frame, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
-            "DeepChatCode",
+            "FreeChatCode",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

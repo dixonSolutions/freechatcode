@@ -1,24 +1,25 @@
-# Poor Man's DeepSeek API 👛
+# FreeChatCode 👛
 
-**Run Codewhale through the free DeepSeek Chat web UI instead of paying for the
-API.** DeepChatCode is a local, OpenAI-compatible bridge: it starts a
-loopback-only relay, drives a real Chromium session through Playwright, and
-hands Codewhale a `deepseek-chat` model that answers from the chat page.
+**Run coding agents through free chat web UIs instead of paying for an API.**
+FreeChatCode is a local, OpenAI-compatible bridge: it starts a loopback-only
+relay, drives a real Chromium session through Playwright, and hands a coding
+agent (Codewhale today) a model that answers from a free chat page — DeepSeek
+Chat first, with more providers on the way.
 
 No API key. No per-token bill. Your own signed-in browser session does the work.
 
 ```
 Codewhale (subprocess)
     ↓  OpenAI-compatible API, 127.0.0.1, random bearer token
-DeepChatCode relay
+FreeChatCode relay
     ↓  Playwright, incremental reads of the visible page
 DeepSeek Chat (Chromium)
 ```
 
 Codewhale still owns the turn loop, tools, permissions, approvals, and
-workspace. DeepChatCode is only the transport.
+workspace. FreeChatCode is only the transport.
 
-![DeepChatCode driving a real DeepSeek Chat turn](assets/demo.gif)
+![FreeChatCode driving a real DeepSeek Chat turn](assets/demo.gif)
 
 *Recorded from a live run: the wrapper opened a fresh conversation, submitted the
 prompt, and read the answer back as it streamed. Full clip:
@@ -40,7 +41,7 @@ prompt, and read the answer back as it streamed. Full clip:
   catalog response were tried against real Codewhale, including a pricing string,
   per-million numbers and an OpenRouter-style object. Codewhale decides it from
   its own catalog. See [STATUS.md](STATUS.md).
-- **The whole pipeline was run for real**: `deepchatcode -- exec "…"` launched
+- **The whole pipeline was run for real**: `freechatcode -- exec "…"` launched
   `codewhale 0.10.0`, which answered through the local relay and the live chat
   page and printed `PONG`, exit 0.
 - A live turn against `chat.deepseek.com`: first streamed chunk at **~0.9 s**,
@@ -72,7 +73,7 @@ what the wrapper does or does not do to a reply.
 ## What it can do
 
 - **Own TUI** — a pre-flight lobby showing codewhale binary, version, relay, and
-  browser health (`deepchatcode tui`).
+  browser health (`freechatcode tui`).
 - **Real browser, real session** — launches a dedicated Chromium profile, or
   attaches to a browser you already have open over CDP.
 - **Headless or visible** — runs headless by default and reopens a visible
@@ -93,10 +94,10 @@ what the wrapper does or does not do to a reply.
   back as OpenAI `tool_calls`, and tool results go back in.
 - **A log that says whose fault it was** — every turn is recorded, failures
   included, with a diagnosis that separates a dead DNS or uplink from a service
-  that answered badly: `deepchatcode turns`.
+  that answered badly: `freechatcode turns`.
 - **Model attribution** — every turn is logged with the mode the page showed
   (for example `DeepThink=on, Search=on`), so a chat can be explained after the
-  fact: `deepchatcode turns`.
+  fact: `freechatcode turns`.
 - **Search, DeepThink, temperature, max tokens** — the page's own mode chips are
   read every turn and recorded (`DeepThink=on, Search=off`), and the **DeepThink
   control is driven**, not just read: asking the relay for `deepseek-pro`
@@ -122,7 +123,7 @@ what the wrapper does or does not do to a reply.
 ## Install
 
 ```bash
-cargo install --git https://github.com/dixonSolutions/DeepChatCode
+cargo install --git https://github.com/dixonSolutions/FreeChatCode
 ```
 
 Not on crates.io yet, so this git install is the one that works today. Or from
@@ -144,8 +145,8 @@ If you would rather pay that download at build time — a Dockerfile or a CI ima
 — the same installer is a binary. It never needs a `playwright` CLI on `PATH`:
 
 ```bash
-cargo run --bin install-deepseek-browser
-cargo run --bin install-deepseek-browser -- --with-deps   # minimal image; uses sudo
+cargo run --bin freechatcode-install-browser
+cargo run --bin freechatcode-install-browser -- --with-deps   # minimal image; uses sudo
 ```
 
 ### The browser installs itself
@@ -155,7 +156,7 @@ crate's own build script) but not the browser. Rather than stopping, the wrapper
 fetches the matching Chromium and retries:
 
 ```
-deepchatcode: Playwright's Chromium is not installed yet; fetching it now
+freechatcode: Playwright's Chromium is not installed yet; fetching it now
               (one time, ~150 MB). Set PLAYWRIGHT_BROWSERS_PATH to put it elsewhere.
 Chrome Headless Shell 153.0.8010.12 (playwright chromium-headless-shell v1243)
               downloaded to ~/.cache/ms-playwright/chromium_headless_shell-1243
@@ -169,13 +170,13 @@ Driver and browser always match, because both come from the same crate version.
 1. **Install Codewhale** if it is not already there:
 
    ```bash
-   deepchatcode install
+   freechatcode install
    ```
 
 2. **Run the bridge** (add `--` to pass anything through to Codewhale):
 
    ```bash
-   deepchatcode
+   freechatcode
    ```
 
 3. **Sign in** in the browser window if you are asked to. Then just use
@@ -185,12 +186,12 @@ Driver and browser always match, because both come from the same crate version.
 
 | Command | What it does |
 | --- | --- |
-| `deepchatcode` | Run the bridge (default) |
-| `deepchatcode tui` | Pre-flight TUI (health), then the bridge |
-| `deepchatcode launch [BINARY]` | Find and remember the codewhale binary, then run |
-| `deepchatcode health` | Check the codewhale binary, relay, browser, auth |
-| `deepchatcode turns [--limit N]` | The recorded turn log: which model answered what |
-| `deepchatcode install` | Install `codewhale-cli` via cargo |
+| `freechatcode` | Run the bridge (default) |
+| `freechatcode tui` | Pre-flight TUI (health), then the bridge |
+| `freechatcode launch [BINARY]` | Find and remember the codewhale binary, then run |
+| `freechatcode health` | Check the codewhale binary, relay, browser, auth |
+| `freechatcode turns [--limit N]` | The recorded turn log: which model answered what |
+| `freechatcode install` | Install `codewhale-cli` via cargo |
 
 Useful flags: `--mode show|silent`, `--model deepseek-chat|deepseek-pro`,
 `--chat-url`, `--profile-dir`, `--cdp-endpoint`, `--record-video <DIR>`,
@@ -208,7 +209,7 @@ Two layers, merged lowest-precedence first:
 
 - **Compiled-in defaults** — `assets/config.default.toml`, embedded in the
   binary with `include_str!`. Ships with the package; not read at runtime.
-- **User config** — `~/.codewhale/deepchatcode/config.toml` (honors
+- **User config** — `~/.codewhale/freechatcode/config.toml` (honors
   `$CODEWHALE_HOME`).
 
 Resolution order for any value: **CLI flag → environment → user config →
@@ -300,7 +301,7 @@ assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistan
 send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
 search_toggle = "div.ds-toggle-button:has-text('Search')"
 thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
-model_label = "div.ds-toggle-button"   # what `deepchatcode turns` records
+model_label = "div.ds-toggle-button"   # what `freechatcode turns` records
 ```
 
 The two toggles and the model label were read off the live page, not guessed.
@@ -344,7 +345,7 @@ allow_extra = []                      # accept a tool call the request never dec
 
 ### Browser lifecycle
 
-DeepChatCode watches the page and its browser context for closure and crashes, so
+FreeChatCode watches the page and its browser context for closure and crashes, so
 it can tell *"the browser is gone"* from *"the page is slow"* without waiting out
 a timeout. Two things then recover it:
 
@@ -360,8 +361,8 @@ a timeout. Two things then recover it:
 [idle] first reply="ONE"
 [idle] conversation=https://chat.deepseek.com/a/chat/s/b60f366c-…
 [idle] pkill status=exit status: 0
- deepchatcode: the browser is gone; reopening it on the conversation and carrying on
- deepchatcode: the browser is back
+ freechatcode: the browser is gone; reopening it on the conversation and carrying on
+ freechatcode: the browser is back
 [idle] the browser came back by itself on …/a/chat/s/b60f366c-…
 ```
 
@@ -375,7 +376,7 @@ and a non-browser failure — a refusal from the model, say — is reported rath
 than retried.
 
 If the whole wrapper is restarted, the conversation is still found: the
-session→conversation link lives in `~/.codewhale/deepchatcode/sessions.db`.
+session→conversation link lives in `~/.codewhale/freechatcode/sessions.db`.
 
 ### The instruction text
 
@@ -385,7 +386,7 @@ file instead:
 
 ```toml
 [codewhale]
-system_prompt = "/home/you/.config/deepchatcode/system-prompt.md"
+system_prompt = "/home/you/.config/freechatcode/system-prompt.md"
 ```
 
 `{project_dir}` and `{payload}` are filled at runtime. If your file has no
@@ -400,7 +401,7 @@ false` to drop the briefing and send a smaller prompt.
 ## Session linking and the turn log
 
 The wrapper keeps an owner-only SQLite database at
-`~/.codewhale/deepchatcode/sessions.db` with two tables.
+`~/.codewhale/freechatcode/sessions.db` with two tables.
 
 **`chat_links`** maps a Codewhale session id to the DeepSeek Chat conversation it
 relays through:
@@ -411,12 +412,12 @@ relays through:
   auto-resume) navigates back to the linked conversation instead of starting
   over. The wrapper verifies the conversation is still reachable and realigns
   from scratch if it is not.
-- `deepchatcode -- --fresh` starts a new conversation and a new link.
+- `freechatcode -- --fresh` starts a new conversation and a new link.
 
 **`chat_turns`** logs one row per turn — *including the ones that failed*:
 
 ```
-$ deepchatcode turns
+$ freechatcode turns
 2026-10-08T04:02:15Z  model=unknown             FAILED (dns, blame=network)  session=-  chat=-
 2026-10-08T03:36:50Z  model=DeepThink=off, …   ok tools=yes chars=0         session=06e87ecd-…  chat=…/a/chat/s/49a41ff7-…
 2026-10-08T03:36:39Z  model=DeepThink=off, …   ok tools=no  chars=225       session=06e87ecd-…  chat=…/a/chat/s/49a41ff7-…

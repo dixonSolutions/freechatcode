@@ -1,20 +1,20 @@
 [package]
-name = "deepchatcode"
+name = "freechatcode"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Poor Man's DeepSeek API — run Codewhale through the free DeepSeek Chat web UI, with no API key"
-repository = "https://github.com/dixonSolutions/DeepChatCode"
+description = "Run coding agents through free chat web UIs — no API key"
+repository = "https://github.com/dixonSolutions/FreeChatCode"
 # So bare `cargo run` launches the bridge rather than asking which binary.
-default-run = "deepchatcode"
+default-run = "freechatcode"
 
 [[bin]]
-name = "deepchatcode"
+name = "freechatcode"
 path = "src/main.rs"
 
 [[bin]]
-name = "install-deepseek-browser"
+name = "freechatcode-install-browser"
 path = "src/install_browser.rs"
 
 [dependencies]

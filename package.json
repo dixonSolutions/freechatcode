@@ -1,12 +1,12 @@
 {
-  "name": "deepchatcode",
+  "name": "freechatcode",
   "version": "0.1.0",
   "private": true,
-  "description": "Poor Man's DeepSeek API — a local, OpenAI-compatible bridge that runs Codewhale through the free DeepSeek Chat web UI instead of a paid API key.",
+  "description": "Run coding agents through free chat web UIs instead of a paid API key — a local, OpenAI-compatible bridge driven through Playwright.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dixonSolutions/DeepChatCode"
+    "url": "https://github.com/dixonSolutions/FreeChatCode"
   },
   "keywords": [
     "codewhale",

@@ -1,6 +1,6 @@
 # STATUS
 
-What DeepChatCode can do, what was verified, and what was not. Last updated
+What FreeChatCode can do, what was verified, and what was not. Last updated
 2026-10-08 on the machine described under [Environment](#environment).
 
 The short version: the bridge works end to end. A real `codewhale` 0.10.0
@@ -43,7 +43,7 @@ chromium --headless=new --remote-debugging-port=9222 \
 | 1 | Resume continues the already-linked chat, no new chat, no re-fed transcript | **Verified live** | After a real turn the wrapper captured `…/a/chat/s/93e26d4c-…`; a second browser opened on that URL reported `link recognised on resume=true`, answered a follow-up, and the URL never changed. Unit tests cover the tail-only prompt. |
 | 2 | Session management is fast | **Verified** | Resolution reads one JSON per session file and picks the newest match; no message bodies are scanned. |
 | 3 | Chat can call tools and get results back through the relay | **Verified live** | Live HTTP through the real router returned `finish_reason: "tool_calls"`, `read_file`, `{"path":"src/main.rs"}` in **1.94 s**. The full agent run below shows the same path with a real listing. |
-| 4 | From a chat, identify which model was used for what | **Verified live** | The page's own chips are read per turn (`DeepThink=off, Search=on`) and every turn is written to `chat_turns`, printed by `deepchatcode turns`. |
+| 4 | From a chat, identify which model was used for what | **Verified live** | The page's own chips are read per turn (`DeepThink=off, Search=on`) and every turn is written to `chat_turns`, printed by `freechatcode turns`. |
 | 5 | Output is chunked as it is written, not only at the end | **Verified** | A test asserts ordered `delta` chunks plus one `finish_reason` chunk; live turns delivered growing snapshots, and a partial JSON envelope is decoded as it arrives. |
 | 6 | Initial prompt recognition + submit are fast | **Verified live** | **923 ms** to the first streamed chunk; **1.44 s** for the whole turn. Zero stalls in the full agent run. Earlier in this work the same turn took 6.3 s, and the previous session reported 30–45 s. |
 | 7a | Config: kill Playwright after a turn or keep it | **Verified live** | `live_turn_closes_browser_when_keep_alive_is_off` asserts the session is dropped after a reply, that the next turn relaunches it, and that it is dropped again. Two turns answered (`PONG`, `OK`). |
@@ -59,7 +59,7 @@ chromium --headless=new --remote-debugging-port=9222 \
 | 14 | Commit nothing useless or sensitive | **Nothing committed — not a git repo** | The workspace has no `.git`. No secrets are in the tree; `.codewhale/` runtime state (pastes, transcripts) is gitignored, as are the session DB and user config. |
 | 15 | Persistent development and testing | **Done** | `cargo test --locked` is the offline gate; the `#[ignore]`d live tests are the end-to-end gate. Both are checked into `src/main.rs`. |
 | 16 | Track browser events; survive the browser being closed or crashing | **Verified live** | The page and its context are watched for `close` and `crash`, so liveness needs no round trip. Two live tests, both on a *copy* of the profile: `live_browser_reopens_on_the_same_conversation_after_a_kill` `SIGKILL`s the browser mid-session and the next turn reopens it on the same conversation and answers (`ONE` → kill → `TWO`); `live_browser_comes_back_while_idle_without_a_turn` kills it and then sends **no turn at all**, and the idle watcher still brings it back on the same conversation. The decision is unit-tested too: a dead browser is recoverable, a model refusal is not. |
-| 17 | The turn record is maintained; failures are recorded and diagnosed | **Verified live** | `chat_turns` now records failed turns as well as answered ones, with `outcome`, `failure_kind`, `blame`, `http_status` and `detail`, plus a migration so an older database gains the columns instead of losing the fields silently. Live proof: pointing the bridge at `deepchatcode-test.invalid` produced `net::ERR_NAME_NOT_RESOLVED` → `FAILED (dns, blame=network)` in the log, with no session at all. The one rule that matters is tested both ways: an unresolvable name is never `blame=service`, and an HTTP status always is. |
+| 17 | The turn record is maintained; failures are recorded and diagnosed | **Verified live** | `chat_turns` now records failed turns as well as answered ones, with `outcome`, `failure_kind`, `blame`, `http_status` and `detail`, plus a migration so an older database gains the columns instead of losing the fields silently. Live proof: pointing the bridge at `freechatcode-test.invalid` produced `net::ERR_NAME_NOT_RESOLVED` → `FAILED (dns, blame=network)` in the log, with no session at all. The one rule that matters is tested both ways: an unresolvable name is never `blame=service`, and an HTTP status always is. |
 | 18 | A conversation keeps answering however long it gets | **Verified live; found and fixed** | The page virtualizes its transcript. Past a few exchanges the mounted window fills and it unmounts an old message in the same render it mounts the new one, so the assistant element count **stops growing** — and the old "one more element than before" test then called a page that had answered *silent*, so every turn died at the 300 s budget. Measured on the live page: a four-prompt conversation left only 2 assistant elements mounted (`count .ds-markdown = 2`) with 4 answers on screen. Detection now keys on the newest reply's **text**, not the count. Live proof — six padded turns in one conversation: `W1`…`W6`, each in ~1.9 s, with the mounted count standing still (`3 -> 3`) on turns 4, 5 and 6 and every reply still read. The test refuses to pass unless at least one turn really did answer without the count growing. |
 | 19 | Two run modes: `show` and `silent` | **Verified** | `mode = "show"` (default) means a visible browser with prompts driven through the page; `mode = "silent"` means headless with prompts sent to the site's API. A mode is a *preset applied under the user config*, so a knob set explicitly still wins — unit-tested in both directions (an explicit `headless = false` survives `silent`; the knob the user left alone follows the mode). `--mode` overrides the file. Sign-in reopens a visible window in both modes. Live: `live_silent_mode_answers_headless_through_the_fallback` answers `QUIET` with no window. |
 | 20 | A pro model, not just a pro name | **Verified live, through the relay** | `/v1/models` advertises `deepseek-chat` and `deepseek-pro`, both served; any other id is still refused (`the_pro_model_is_served_and_a_stranger_is_still_refused`, which also asserts the reply names the model that was asked for). `deepseek-pro` is not a second endpoint — it is the page with its DeepThink control engaged, and the toggle is *driven*, read back, and put back. Live, directly: `live_the_pro_model_engages_the_pages_reasoning_mode` read the chips `DeepThink=off → on → on through a real turn (reply "PRO") → off`. Live, through the real router: `live_relay_engages_pro_for_a_pro_request` POSTs a `deepseek-pro` request and reads the chips back `off → on`, then POSTs a `deepseek-chat` request and reads them `on → off`, with the replies `ELEVEN`/`TWELVE` and `model` reported as `deepseek-pro`/`deepseek-chat`. And live on the path that was almost a hole: `live_silent_mode_still_honours_a_pro_request` runs `silent` + pro and reads back `chips="DeepThink=on, Search=on"` with the reply `THIRTEEN`, after the api template refused because it cannot express reasoning. A pro turn that cannot engage the control fails rather than answering as the plain model. |
@@ -69,7 +69,7 @@ chromium --headless=new --remote-debugging-port=9222 \
 ### The whole pipeline: real codewhale → relay → browser → DeepSeek
 
 ```
-$ deepchatcode -- exec "Reply with exactly the word PONG and nothing else."
+$ freechatcode -- exec "Reply with exactly the word PONG and nothing else."
 Using codewhale binary: ~/.cargo/bin/codewhale
 Browser relay audit: …/audit/session-5c5ff5b361ed4e80b02216054dc6c93e.jsonl
 Sign in directly in the browser window if needed; the wrapper never reads credentials.
@@ -163,7 +163,7 @@ test result: ok. 1 passed; 0 failed; finished in 7.40s
 
 ```
 $ cargo test -- --ignored --nocapture live_silent_mode_answers_headless_through_the_fallback
-deepchatcode: the direct API path refused (the api transport returned no text
+freechatcode: the direct API path refused (the api transport returned no text
   (HTTP 200, 48 bytes): {"code":40003,"msg":"INVALID_TOKEN","data":null});
   using the headless page for this turn instead
 [silent] reply="QUIET"
@@ -187,7 +187,7 @@ generous for a page that then answers a turn in two.
 
 ```
 $ cargo test -- --ignored --nocapture live_silent_mode_still_honours_a_pro_request
-deepchatcode: the direct API path refused (the page is in pro mode but
+freechatcode: the direct API path refused (the page is in pro mode but
   [transport.api] body has no {thinking} placeholder, so the endpoint cannot be
   told which model to use; add {thinking} to the body template, or run with
   [transport] mode = "gui"); using the headless page for this turn instead
@@ -209,7 +209,7 @@ wrapper binary starts, launches real Codewhale, drives a real browser on a copy 
 the profile, and each test pins one property:
 
 ```
-$ cargo test --locked --bin deepchatcode -- --ignored --nocapture
+$ cargo test --locked --bin freechatcode -- --ignored --nocapture
 
 live_a_real_agent_reads_a_file_through_the_bridge
 [agent] exit=Some(0) | tool read completed: The token is MAGIC-TOKEN-7F3A.
@@ -233,7 +233,7 @@ next decision. The third records a boundary rather than a wish: a one-shot
 `codewhale exec` saves no session, `--session-id` resumes rather than creates one,
 so two independent one-shot runs cannot recall each other — and the wrapper starts
 clean instead of pretending otherwise. Cross-run memory is a session feature, which
-an interactive `deepchatcode launch codewhale` has and a one-shot does not. The
+an interactive `freechatcode launch codewhale` has and a one-shot does not. The
 design is written out in [docs/design.md](docs/design.md).
 
 That suite is also what forced the last change to the contract: the first version
@@ -270,7 +270,7 @@ Codewhale in the terminal     after it    0.00 s
 Reproduce with a profile copy, so a live session keeps its own browser:
 
 ```bash
-target/release/deepchatcode --mode silent --profile-dir <copy> -- exec "Reply with exactly the word PING and nothing else."
+target/release/freechatcode --mode silent --profile-dir <copy> -- exec "Reply with exactly the word PING and nothing else."
 ```
 
 The wrapper prints both numbers on every start — `Codewhale started at Ns` and
@@ -299,7 +299,7 @@ An `LD_PRELOAD` interposer that logs every `tcsetattr` in the whole process tree
 named the writer in one run — and it was not the browser, and not Codewhale:
 
 ```
-31006.9659 pid=771513 comm=deepchatcode  tcsetattr fd=0(/dev/pts/1) ECHO=1 ICANON=1 ISIG=1
+31006.9659 pid=771513 comm=freechatcode  tcsetattr fd=0(/dev/pts/1) ECHO=1 ICANON=1 ISIG=1
 t=0.16s  echo=0 icanon=0 isig=0   <- Codewhale's TUI sets raw mode, correctly
 t=0.33s  echo=1 icanon=1 isig=1   <- our own process writes the cooked state back
 ```
@@ -327,22 +327,22 @@ fix present              False        0
 bare Codewhale (control) False        0
 ```
 
-And the same A/B through the entry point the report named (`deepchatcode tui`,
+And the same A/B through the entry point the report named (`freechatcode tui`,
 lobby → `q` → bridge → Codewhale's TUI), where the damage lands immediately after
 the handover:
 
 ```
                                               lobby up   after q   after 8 reports
-deepchatcode.prefix (fix disabled)  raw        cooked     cooked  -> 1 screen line:
+freechatcode.prefix (fix disabled)  raw        cooked     cooked  -> 1 screen line:
     ???^[[<0;10;5M^[[<3;12;7M^[[<35;10;5M^[[<0;10;5M^[[<3;12;7M^[[<35;10;5M^[[<0;10;5Mntials.
-deepchatcode.fixed                  raw        raw        raw     -> 0 screen lines
+freechatcode.fixed                  raw        raw        raw     -> 0 screen lines
 ```
 
 The reports are painted *inside* the app's own text — that `ntials.` is the tail
 of "the wrapper never reads credentials" — which is exactly the signature in the
 original report.
 
-`LD_PRELOAD` trace after the fix: zero `tcsetattr` calls from `comm=deepchatcode`,
+`LD_PRELOAD` trace after the fix: zero `tcsetattr` calls from `comm=freechatcode`,
 against two before it. Codewhale's own TUI renders identically to the bare control,
 so the explicit terminal costs the child nothing.
 
@@ -462,7 +462,7 @@ the turn. From the page itself, on the same conversation:
 
 ```
 [inspect] last assistant text (992 chars): Here is the answer.
-          DeepChatCode is a local, OpenAI-compatible bridge ...
+          FreeChatCode is a local, OpenAI-compatible bridge ...
 ```
 
 The relay had recorded **208**. That is the "it got stuck printing the answer"
@@ -490,7 +490,7 @@ writes half an answer, pauses longer than the old window, then writes the rest.
 Against the old value it fails in exactly the way the user described —
 
 ```
-deepchatcode: reply settled after 3 polls (39 chars, 0s); page send control(s): 1
+freechatcode: reply settled after 3 polls (39 chars, 0s); page send control(s): 1
 the relay stopped reading at the pause and returned a partial answer:
   "{\"type\":\"final\",\"content\":\"first half\"}"
 ```
@@ -504,7 +504,7 @@ rather than assumed, and it does not exist here: at the moment the reply settled
 with the page idle and the answer complete,
 
 ```
-deepchatcode: reply settled after 20 polls (264 chars, 4s); page send control(s): 0
+freechatcode: reply settled after 20 polls (264 chars, 4s); page send control(s): 0
 ```
 
 the configured `[selectors] send` matches **nothing** — on this page it never
@@ -539,7 +539,7 @@ not leak. This test is also what caught the model field being hardcoded — see
 ### Local OCR and vision
 
 ```
-DeepChatCode OCR self-test        # tesseract, ollama and auto all agreed
+FreeChatCode OCR self-test        # tesseract, ollama and auto all agreed
 Invoice 2024-0042
 Total: 137.50 USD
 handshake-verified
@@ -774,7 +774,7 @@ wrong password   -> exit 134, ERRCONNECT_LOGON_FAILURE [0x00020014],
 - An `api` failure said "returned no text (48 bytes)" with no clue why. It now
   reports the HTTP status and the first 240 bytes of the body, which is what
   made the `INVALID_TOKEN` → `MISSING_HEADER` diagnosis possible.
-- `install-deepseek-browser` shelled out to a `playwright` CLI that usually is
+- `freechatcode-install-browser` shelled out to a `playwright` CLI that usually is
   not on `PATH` (it is an npm package) and panicked with `No such file or
   directory`. It now uses the crate's own installer, so the browser always
   matches the driver — and a first run installs it automatically instead of

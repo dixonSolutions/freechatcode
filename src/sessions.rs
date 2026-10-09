@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn turn_log_round_trips_newest_first() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
         assert!(store.turns(10).expect("empty").is_empty());
 
         store
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn a_failed_turn_is_recorded_with_its_diagnosis() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
         // No session at all — the record must still exist.
         store
             .record_turn(&TurnRow {
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn link_store_round_trips_and_updates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
 
         assert_eq!(store.get("session-a").expect("get"), None);
         store

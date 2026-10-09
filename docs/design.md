@@ -1,6 +1,6 @@
 # The split
 
-DeepChatCode is one piece of a three-part system, and every design question here
+FreeChatCode is one piece of a three-part system, and every design question here
 resolves the same way: **who owns what**. Getting this boundary wrong is what
 produced the two worst bugs in this repository's history, so it is written down
 rather than implied.
@@ -18,7 +18,7 @@ it in the workspace, feeds the result back, keeps going until it is done, and
 holds the permissions, approvals, and tool catalog. None of that is the
 wrapper's business, and the wrapper must never try to do it.
 
-**DeepChatCode (the wrapper) owns the move.** It is a *model endpoint*: messages
+**FreeChatCode (the wrapper) owns the move.** It is a *model endpoint*: messages
 go in, text comes out. Nothing more.
 
 ```
@@ -75,7 +75,7 @@ Codewhale ── requests ──▶ wrapper ── text ──▶ the page
 ## Where resume lives
 
 The wrapper links a conversation to a **Codewhale session**. That works whenever
-there is one: an interactive `deepchatcode launch codewhale` persists a session, so
+there is one: an interactive `freechatcode launch codewhale` persists a session, so
 the next run navigates back to the linked conversation instead of re-feeding the
 transcript.
 
@@ -107,7 +107,7 @@ a real browser on a copy of the profile. Three tests, each a different property 
 the split:
 
 ```
-$ cargo test --locked --bin deepchatcode -- --ignored --nocapture
+$ cargo test --locked --bin freechatcode -- --ignored --nocapture
 
 live_a_real_agent_reads_a_file_through_the_bridge
 [agent] exit=Some(0) | tool read completed: The token is MAGIC-TOKEN-7F3A.

@@ -5,7 +5,7 @@
 //! 1. **Committed defaults** — `assets/config.default.toml`, embedded into the
 //!    binary with [`include_str!`]. Shipped with the package, never read from
 //!    disk at runtime.
-//! 2. **User config** — `~/.codewhale/deepchatcode/config.toml` (honoring
+//! 2. **User config** — `~/.codewhale/freechatcode/config.toml` (honoring
 //!    `$CODEWHALE_HOME`). Per-machine values and overrides of any default.
 //!
 //! Command-line flags and environment variables are applied on top of the
@@ -23,7 +23,26 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("../assets/config.default.tom
 /// The user-config location under the Codewhale home directory.
 #[must_use]
 pub fn user_config_path(home: &Path) -> PathBuf {
-    home.join("deepchatcode").join("config.toml")
+    home.join("freechatcode").join("config.toml")
+}
+
+/// One-time migration from the pre-rename project directory
+/// (`<home>/deepchatcode`) to the current one (`<home>/freechatcode`).
+///
+/// Non-destructive: the legacy directory is renamed in place, and is left
+/// untouched when the current directory already exists.
+pub fn migrate_legacy_home(home: &Path) {
+    let legacy = home.join("deepchatcode");
+    let current = home.join("freechatcode");
+    if legacy.exists() && !current.exists() {
+        if let Err(error) = std::fs::rename(&legacy, &current) {
+            eprintln!(
+                "freechatcode: could not migrate legacy config dir {} to {}: {error}",
+                legacy.display(),
+                current.display()
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1078,7 +1097,7 @@ mod tests {
     #[test]
     fn remember_binary_creates_the_config_when_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("deepchatcode/config.toml");
+        let path = dir.path().join("freechatcode/config.toml");
         remember_binary(&path, Path::new("/usr/bin/codewhale")).expect("remember");
         assert_eq!(
             Config::load(Some(&path))

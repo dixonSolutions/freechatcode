@@ -21,14 +21,14 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use deepchatcode::config::{
+use freechatcode::config::{
     self, ApiTransportConfig, BrowserMode, ChatConfig, Config, RunMode, Selectors, Timeouts,
     TransportMode,
 };
-use deepchatcode::health;
-use deepchatcode::sessions::{self, SessionLinks, TurnRow};
-use deepchatcode::setup;
-use deepchatcode::{
+use freechatcode::health;
+use freechatcode::sessions::{self, SessionLinks, TurnRow};
+use freechatcode::setup;
+use freechatcode::{
     AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, MODEL_ID, PRO_MODEL_ID,
     ServerState, ToolPolicy, TurnRecord, TurnSink, extract_api_text, router, serves_model,
 };
@@ -37,8 +37,8 @@ mod tui;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "deepchatcode",
-    about = "Poor Man's DeepSeek API — run Codewhale through the free DeepSeek Chat web UI"
+    name = "freechatcode",
+    about = "Run coding agents through free chat web UIs — no API key"
 )]
 struct Args {
     #[command(subcommand)]
@@ -142,10 +142,10 @@ impl Session {
         // A watcher that will not register is not fatal: the liveness check falls
         // back to asking the page itself.
         if let Err(error) = watched_page(&page, Arc::clone(&closed)).await {
-            eprintln!("deepchatcode: could not watch the page for closure: {error}");
+            eprintln!("freechatcode: could not watch the page for closure: {error}");
         }
         if let Err(error) = watched_context(&context, Arc::clone(&closed)).await {
-            eprintln!("deepchatcode: could not watch the browser context for closure: {error}");
+            eprintln!("freechatcode: could not watch the browser context for closure: {error}");
         }
         Ok(Self {
             page,
@@ -342,7 +342,7 @@ impl BrowserChat {
                 Ok(context) => context,
                 Err(PlaywrightError::BrowserNotInstalled { .. }) if !installed_browser => {
                     eprintln!(
-                        "deepchatcode: Playwright's Chromium is not installed yet; fetching it \
+                        "freechatcode: Playwright's Chromium is not installed yet; fetching it \
                          now (one time, ~150 MB). Set PLAYWRIGHT_BROWSERS_PATH to put it elsewhere."
                     );
                     playwright_rs::install_browsers(Some(&["chromium"]))
@@ -535,7 +535,7 @@ impl BrowserChat {
             && !session.is_alive()
         {
             eprintln!(
-                "deepchatcode: the browser is gone; reopening it on the conversation and carrying on"
+                "freechatcode: the browser is gone; reopening it on the conversation and carrying on"
             );
             if let Some(gone) = guard.take() {
                 close_session(gone).await;
@@ -707,7 +707,7 @@ impl BrowserChat {
                             if !api_refused {
                                 api_refused = true;
                                 eprintln!(
-                                    "deepchatcode: the direct API path refused ({error}); \
+                                    "freechatcode: the direct API path refused ({error}); \
                                      using the headless page for this turn instead"
                                 );
                             }
@@ -724,7 +724,7 @@ impl BrowserChat {
                         break Err(error);
                     }
                     eprintln!(
-                        "deepchatcode: the browser did not survive the turn ({error}); \
+                        "freechatcode: the browser did not survive the turn ({error}); \
                          reopening it and retrying once"
                     );
                     if let Some(gone) = guard.take() {
@@ -955,7 +955,7 @@ impl BrowserChat {
                         .await
                         .unwrap_or(0);
                     eprintln!(
-                        "deepchatcode: reply settled after {} polls ({} chars, {}s); \
+                        "freechatcode: reply settled after {} polls ({} chars, {}s); \
                          page send control(s): {send_controls}",
                         stable_polls,
                         prior_text.len(),
@@ -967,7 +967,7 @@ impl BrowserChat {
             if last_note.elapsed() >= Duration::from_secs(15) {
                 last_note = Instant::now();
                 eprintln!(
-                    "deepchatcode: waiting for the page… {}s of {}s | {} assistant element(s) ({} before this turn) | composer {} char(s) | newest reply {} char(s)",
+                    "freechatcode: waiting for the page… {}s of {}s | {} assistant element(s) ({} before this turn) | composer {} char(s) | newest reply {} char(s)",
                     started.elapsed().as_secs(),
                     self.response_timeout.as_secs(),
                     count,
@@ -988,7 +988,7 @@ impl BrowserChat {
                     String::new()
                 };
                 eprintln!(
-                    "deepchatcode: no reply after {}s. Open {url} to see what the page is \
+                    "freechatcode: no reply after {}s. Open {url} to see what the page is \
                      showing; the conversation is linked to this Codewhale session.",
                     self.response_timeout.as_secs()
                 );
@@ -1030,7 +1030,7 @@ impl BrowserChat {
             }
             Err(error) => {
                 eprintln!(
-                    "deepchatcode: could not return to the bare chat URL ({error:#}); falling back to the New chat control"
+                    "freechatcode: could not return to the bare chat URL ({error:#}); falling back to the New chat control"
                 );
             }
         }
@@ -1043,18 +1043,18 @@ impl BrowserChat {
         }
         if button.count().await.unwrap_or(0) == 0 {
             eprintln!(
-                "deepchatcode: no New Chat control found; sending into the current conversation"
+                "freechatcode: no New Chat control found; sending into the current conversation"
             );
             return Ok(());
         }
         match tokio::time::timeout(Duration::from_secs(3), button.first().click(None)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
-                eprintln!("deepchatcode: could not start a new chat ({error}); continuing");
+                eprintln!("freechatcode: could not start a new chat ({error}); continuing");
                 Ok(())
             }
             Err(_) => {
-                eprintln!("deepchatcode: starting a new chat timed out; continuing");
+                eprintln!("freechatcode: starting a new chat timed out; continuing");
                 Ok(())
             }
         }
@@ -1094,7 +1094,7 @@ impl BrowserChat {
             }
 
             eprintln!(
-                "deepchatcode: the browser is gone; reopening it on the conversation and carrying on"
+                "freechatcode: the browser is gone; reopening it on the conversation and carrying on"
             );
             if let Some(gone) = guard.take() {
                 close_session(gone).await;
@@ -1102,12 +1102,12 @@ impl BrowserChat {
             match self.open().await {
                 Ok(session) => {
                     *guard = Some(session);
-                    eprintln!("deepchatcode: the browser is back");
+                    eprintln!("freechatcode: the browser is back");
                     wait = interval;
                 }
                 Err(error) => {
                     let message = first_line(&format!("{error:#}"));
-                    eprintln!("deepchatcode: could not reopen the browser yet: {message}");
+                    eprintln!("freechatcode: could not reopen the browser yet: {message}");
                     wait = (wait * 2).min(MAX_LIVENESS_BACKOFF);
                 }
             }
@@ -1269,10 +1269,10 @@ async fn close_session(session: Session) {
         && session.is_alive()
         && let Err(error) = session.context.close().await
     {
-        eprintln!("deepchatcode: closing the browser context failed: {error}");
+        eprintln!("freechatcode: closing the browser context failed: {error}");
     }
     if let Err(error) = session.playwright.shutdown().await {
-        eprintln!("deepchatcode: stopping the Playwright driver failed: {error}");
+        eprintln!("freechatcode: stopping the Playwright driver failed: {error}");
     }
 }
 
@@ -1491,7 +1491,7 @@ impl UrlLinkingChat {
                 true
             }
             Err(error) => {
-                eprintln!("deepchatcode: could not record the session link: {error}");
+                eprintln!("freechatcode: could not record the session link: {error}");
                 false
             }
         }
@@ -1597,7 +1597,7 @@ fn iso_utc(seconds: i64) -> String {
 
 /// Print the recorded turn log.
 fn print_turns(home: &Path, limit: usize) -> Result<()> {
-    let links = SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+    let links = SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
         .map_err(|error| anyhow::anyhow!(error))?;
     let rows = links.turns(limit).map_err(|error| anyhow::anyhow!(error))?;
     if rows.is_empty() {
@@ -1666,7 +1666,7 @@ async fn run_lobby(binary: Option<&str>) -> Result<()> {
 /// discipline into raw mode — the terminal comes back with `ECHO` on, and the
 /// TUI's own mouse reports are then echoed back through the line discipline as
 /// `^[[<0;10;5M` text scattered over the screen. Measured, not guessed: an
-/// `LD_PRELOAD` interposer shows `comm=deepchatcode tcsetattr fd=0(/dev/pts/N)`
+/// `LD_PRELOAD` interposer shows `comm=freechatcode tcsetattr fd=0(/dev/pts/N)`
 /// with the cooked flags at the moment the browser appears, and the bare
 /// Codewhale TUI never does this to itself.
 ///
@@ -1704,12 +1704,16 @@ fn take_terminal_off_stdin() -> Option<std::fs::File> {
 }
 
 fn default_home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    dirs::home_dir()
-        .map(|home| home.join(".codewhale"))
-        .context("could not resolve the Codewhale home directory")
+    let home = if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
+        PathBuf::from(home)
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".codewhale"))
+            .context("could not resolve the Codewhale home directory")?
+    };
+    // One-time migration from the pre-rename project directory.
+    config::migrate_legacy_home(&home);
+    Ok(home)
 }
 
 async fn set_private_directory(path: &Path) -> Result<()> {
@@ -1742,14 +1746,14 @@ async fn set_private_file(path: &Path) -> Result<()> {
 /// the desktop popup goes through `notify-send` and is skipped when disabled or
 /// unavailable.
 fn notify(enabled: bool, summary: &str, body: &str) {
-    eprintln!("deepchatcode: {summary} — {body}");
+    eprintln!("freechatcode: {summary} — {body}");
     if !enabled {
         return;
     }
     let _ = std::process::Command::new("notify-send")
         .args([
             "--app-name",
-            "DeepChatCode",
+            "FreeChatCode",
             "--expire-time",
             "6000",
             summary,
@@ -1835,7 +1839,7 @@ async fn run() -> Result<()> {
         PathBuf::from(path)
     } else {
         if remembered.is_some() {
-            eprintln!("deepchatcode: the remembered codewhale binary is gone; rediscovering");
+            eprintln!("freechatcode: the remembered codewhale binary is gone; rediscovering");
         }
         setup::find_codewhale_binary(None)?
     };
@@ -1843,7 +1847,7 @@ async fn run() -> Result<()> {
     if pinned.is_none()
         && let Err(error) = config::remember_binary(&config_path, &codewhale_bin)
     {
-        eprintln!("deepchatcode: could not remember the codewhale binary: {error}");
+        eprintln!("freechatcode: could not remember the codewhale binary: {error}");
     }
 
     let profile = args
@@ -1864,7 +1868,7 @@ async fn run() -> Result<()> {
     let project_dir = workspace.to_string_lossy().into_owned();
     let sessions_dir = home.join("sessions");
     let links = Arc::new(
-        SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+        SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
             .map_err(|error| anyhow::anyhow!(error))?,
     );
     let session = match codewhale_intent(&codewhale_args) {
@@ -1955,7 +1959,7 @@ async fn run() -> Result<()> {
                 return;
             }
             eprintln!(
-                "deepchatcode: browser ready in {:.1}s",
+                "freechatcode: browser ready in {:.1}s",
                 started.elapsed().as_secs_f64()
             );
             // The Codewhale session is the source of truth: verify the linked
@@ -2097,7 +2101,7 @@ async fn run() -> Result<()> {
         .spawn()
         .with_context(|| format!("launch Codewhale executable {:?}", codewhale_bin))?;
     eprintln!(
-        "deepchatcode: Codewhale started at {:.2}s (browser warming in parallel)",
+        "freechatcode: Codewhale started at {:.2}s (browser warming in parallel)",
         startup.elapsed().as_secs_f64()
     );
 
@@ -2138,7 +2142,7 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("deepchatcode: {error:#}");
+        eprintln!("freechatcode: {error:#}");
         std::process::exit(1);
     }
 }
@@ -2559,11 +2563,11 @@ mod tests {
                 forward_system_prompt: false,
             },
         )
-        // Record into the real turn log, so `deepchatcode turns` can be checked
+        // Record into the real turn log, so `freechatcode turns` can be checked
         // against rows a live turn actually wrote.
         .with_turns({
             let links = Arc::new(
-                SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+                SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
                     .expect("open link store"),
             );
             let session = sessions::resolve_session_id(&home.join("sessions"), &workspace, None);
@@ -3545,19 +3549,19 @@ mod tests {
         let profile_dir = deps.parent().expect("profile directory");
         let target = profile_dir.parent().unwrap_or(profile_dir);
         let cli = [
-            target.join("release/deepchatcode"),
-            profile_dir.join("deepchatcode"),
+            target.join("release/freechatcode"),
+            profile_dir.join("freechatcode"),
         ]
         .into_iter()
         .find(|candidate| candidate.exists())
-        .unwrap_or_else(|| profile_dir.join("deepchatcode"));
+        .unwrap_or_else(|| profile_dir.join("freechatcode"));
         let help = std::process::Command::new(&cli)
             .arg("--help")
             .output()
             .unwrap_or_else(|error| panic!("run {}: {error}", cli.display()));
         assert!(
             String::from_utf8_lossy(&help.stdout).contains("--mode"),
-            "{} is stale (no --mode); rebuild it: cargo build --bin deepchatcode",
+            "{} is stale (no --mode); rebuild it: cargo build --bin freechatcode",
             cli.display()
         );
         cli
@@ -3596,7 +3600,7 @@ mod tests {
     /// second, independent one-shot cannot recall the first, and the honest
     /// behaviour is to start clean rather than inherit a stranger's conversation.
     /// Cross-run memory is a session feature: it is what an interactive
-    /// `deepchatcode launch codewhale` has and a one-shot does not.
+    /// `freechatcode launch codewhale` has and a one-shot does not.
     ///
     /// What this pins is therefore two things: a tool really runs in the
     /// workspace, and unrelated runs do not leak state into each other.
@@ -3957,7 +3961,7 @@ mod tests {
     async fn the_turn_log_writes_a_failure_row_with_its_diagnosis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let links = Arc::new(
-            SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open"),
+            SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open"),
         );
         let log = TurnLog {
             links: Arc::clone(&links),
@@ -4018,7 +4022,7 @@ mod tests {
     /// holds whether or not the machine has a network at all.
     #[tokio::test]
     async fn a_silent_page_with_no_dns_is_not_the_services_fault() {
-        let ui = classifier_for("https://deepchatcode-test.invalid");
+        let ui = classifier_for("https://freechatcode-test.invalid");
         let failure = ui.classify("no visible assistant reply within 300s").await;
         assert_eq!(failure.kind, "dns");
         assert_eq!(failure.blame, "network");
@@ -4418,7 +4422,7 @@ mod tests {
             .unwrap_or_else(|_| "Reply with exactly the word PONG and nothing else.".to_owned());
         let workspace = std::env::current_dir().expect("cwd");
         let sessions_dir = home.join("sessions");
-        let links = SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+        let links = SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
             .expect("open link store");
         let session = sessions::resolve_session_id(&sessions_dir, &workspace, None);
         let linked = session

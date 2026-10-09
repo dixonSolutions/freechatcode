@@ -27,7 +27,7 @@ async fn main() {
     };
 
     if let Err(error) = result {
-        eprintln!("deepchatcode: could not install Playwright Chromium: {error}");
+        eprintln!("freechatcode: could not install Playwright Chromium: {error}");
         if !with_deps {
             eprintln!(
                 "If it downloaded but will not start, the browser's system libraries are missing. \

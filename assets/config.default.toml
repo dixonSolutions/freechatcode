@@ -1,11 +1,11 @@
-# DeepChatCode — compiled-in defaults.
+# FreeChatCode — compiled-in defaults.
 #
 # This file is committed to the repository and embedded into the binary with
 # `include_str!`. It is the shared source of truth for values that ship with
 # the package; it is NOT read from disk at runtime. Every key here can be
 # overridden per machine in the user config:
 #
-#   ~/.codewhale/deepchatcode/config.toml   (honors $CODEWHALE_HOME)
+#   ~/.codewhale/freechatcode/config.toml   (honors $CODEWHALE_HOME)
 #
 # These values can drift when the DeepSeek Chat web UI changes. Overriding them
 # in the user config lets you patch a broken selector or URL without rebuilding
