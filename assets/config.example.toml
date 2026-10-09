@@ -48,24 +48,29 @@ binary = "/home/you/.cargo/bin/codewhale"
 # timeout_secs = 300
 # body = "{\"messages\":{messages},\"stream\":true}"
 
-# Override the chat address or accepted hosts.
-[chat]
-# url = "https://chat.deepseek.com"
-# allowed_hosts = ["chat.deepseek.com"]
-# routed_url_pattern = "/a/chat/s/"
-
-# Patch a selector when the DeepSeek Chat UI changes — no rebuild needed.
-[selectors]
-# composer = "textarea"
-# assistant = ".ds-markdown"
-# send = "button[type='submit']"
+# Add a second provider (a free chat site). The shipped defaults already
+# define the DeepSeek provider; add Gemini here. Selectors are best-effort —
+# verify them against the live page before relying on them (see `doctor`).
+#
+# [[providers]]
+# id = "gemini"
+# name = "Gemini"
+#
+# [providers.chat]
+# url = "https://gemini.google.com"
+# allowed_hosts = ["gemini.google.com"]
+# routed_url_pattern = "/app/"
+#
+# [providers.selectors]
+# composer = "div.ql-editor, [contenteditable='true']"
+# assistant = "model-response, [data-testid*='model']"
+# send = "button[aria-label*='send' i]"
 # new_chat = "button[aria-label*='new chat' i]"
-# search_toggle = "button[aria-label*='search' i]"
-# thinking_toggle = "button[aria-label*='think' i]"
-# file_upload = "input[type='file']"
-# Element naming the model in use, so `freechatcode turns` can attribute a
-# reply to a model. Empty (the default) records it as unknown.
 # model_label = "[data-testid*='model' i]"
+#
+# [[providers.models]]
+# id = "gemini-flash"
+# name = "Gemini Flash"
 
 # Tool forwarding. By default Codewhale's full catalog is forwarded to the
 # chat. Set forward_all = false to send only the essentials plus the search

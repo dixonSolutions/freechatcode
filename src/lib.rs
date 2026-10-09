@@ -49,12 +49,6 @@ pub const PRO_MODEL_ID: &str = "deepseek-pro";
 /// there is no per-token bill to report. Everything the wrapper is asked about
 /// pricing returns this, so a caller never has to render "unknown".
 pub const PRICING_LABEL: &str = "Unlimited Chat!";
-
-/// Whether this wrapper serves `id`.
-#[must_use]
-pub fn serves_model(id: &str) -> bool {
-    id == MODEL_ID || id == PRO_MODEL_ID
-}
 /// The instruction text handed to the chat model. Committed and embedded in the
 /// binary; override the path with `[codewhale] system_prompt` in config.
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../assets/system-prompt.md");
@@ -94,16 +88,17 @@ pub trait ChatUi: Send + Sync {
         None
     }
 
-    /// Put the page into the reasoning mode the next turn needs.
+    /// Put the page into the state the model this turn asks for.
     ///
-    /// `deepseek-pro` is not a second endpoint: it is this page with its
-    /// DeepThink control engaged, so the model that answers is decided by page
-    /// state. Called before every turn with the mode that turn asked for, which
-    /// is also how the state is put back. Implementations that cannot reach the
-    /// control must fail: answering a pro request with the plain model while
-    /// claiming otherwise is worse than not answering.
-    async fn set_reasoning(&self, pro: bool) -> Result<(), String> {
-        let _ = pro;
+    /// A model is not a second endpoint: it is a page with a control (a
+    /// reasoning chip, a model dropdown) engaged, so which model answers is
+    /// decided by page state. Called before every turn with the toggles that
+    /// turn's model needs, which is also how the state is put back for the next
+    /// turn. Implementations that cannot reach a requested control must fail:
+    /// answering a pro request with the plain model while claiming otherwise is
+    /// worse than not answering.
+    async fn set_model_state(&self, toggles: &[config::Toggle]) -> Result<(), String> {
+        let _ = toggles;
         Ok(())
     }
 
@@ -276,22 +271,87 @@ impl Default for BridgeOptions {
     }
 }
 
+/// One model the relay serves: its id, the provider it belongs to, and the page
+/// state that selects it.
+#[derive(Clone)]
+pub struct ModelSpec {
+    pub id: String,
+    /// Provider id, reported as `owned_by` in `/v1/models`.
+    pub owned_by: String,
+    pub name: Option<String>,
+    /// Page controls to set before a turn. Empty = the provider's plain model.
+    pub toggles: Vec<config::Toggle>,
+}
+
+/// One conversation (one browser tab) and the models that share it. Models that
+/// differ only by page state — DeepSeek chat vs. pro, say — share one thread, so
+/// they share one relay and one UI.
+#[derive(Clone)]
+pub struct RouteGroup {
+    pub ui: Arc<dyn ChatUi>,
+    pub models: Vec<ModelSpec>,
+}
+
+#[derive(Clone)]
+struct ModelRoute {
+    ui: Arc<dyn ChatUi>,
+    relay: Arc<Mutex<ConversationRelay>>,
+    owned_by: String,
+    name: Option<String>,
+    toggles: Vec<config::Toggle>,
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     token: Arc<str>,
-    relay: Arc<Mutex<ConversationRelay>>,
-    ui: Arc<dyn ChatUi>,
+    /// Ordered `(model_id, route)` pairs, in catalog order.
+    routes: Vec<(String, ModelRoute)>,
     audit: Arc<dyn AuditSink>,
     turns: Arc<dyn TurnSink>,
     options: BridgeOptions,
 }
 
 impl ServerState {
+    /// Build the relay around one or more chat tabs, in catalog order. Each
+    /// [`RouteGroup`] is one conversation; its models are served from it.
+    #[must_use]
+    pub fn with_routes(
+        token: impl Into<Arc<str>>,
+        groups: Vec<RouteGroup>,
+        audit: Arc<dyn AuditSink>,
+        options: BridgeOptions,
+    ) -> Self {
+        let mut routes = Vec::new();
+        for group in groups {
+            let relay = Arc::new(Mutex::new(ConversationRelay::new(options.start_fresh)));
+            for model in group.models {
+                routes.push((
+                    model.id,
+                    ModelRoute {
+                        ui: Arc::clone(&group.ui),
+                        relay: Arc::clone(&relay),
+                        owned_by: model.owned_by,
+                        name: model.name,
+                        toggles: model.toggles,
+                    },
+                ));
+            }
+        }
+        Self {
+            token: token.into(),
+            routes,
+            audit,
+            turns: Arc::new(NoopTurns),
+            options,
+        }
+    }
+
     #[must_use]
     pub fn new(token: impl Into<Arc<str>>, ui: Arc<dyn ChatUi>, audit: Arc<dyn AuditSink>) -> Self {
         Self::with_options(token, ui, audit, BridgeOptions::default())
     }
 
+    /// A single-tab convenience for tests and one-model setups.
     #[must_use]
     pub fn with_options(
         token: impl Into<Arc<str>>,
@@ -299,14 +359,20 @@ impl ServerState {
         audit: Arc<dyn AuditSink>,
         options: BridgeOptions,
     ) -> Self {
-        Self {
-            token: token.into(),
-            relay: Arc::new(Mutex::new(ConversationRelay::new(options.start_fresh))),
-            ui,
+        Self::with_routes(
+            token,
+            vec![RouteGroup {
+                ui,
+                models: vec![ModelSpec {
+                    id: MODEL_ID.to_owned(),
+                    owned_by: "test".to_owned(),
+                    name: None,
+                    toggles: Vec::new(),
+                }],
+            }],
             audit,
-            turns: Arc::new(NoopTurns),
             options,
-        }
+        )
     }
 
     /// Attach a sink that records a row per finished turn.
@@ -314,6 +380,20 @@ impl ServerState {
     pub fn with_turns(mut self, turns: Arc<dyn TurnSink>) -> Self {
         self.turns = turns;
         self
+    }
+
+    /// The route serving `model_id`, if the relay serves it.
+    fn route(&self, model_id: &str) -> Option<&ModelRoute> {
+        self.routes
+            .iter()
+            .find(|(id, _)| id == model_id)
+            .map(|(_, route)| route)
+    }
+
+    /// Whether the relay serves `model_id`.
+    #[must_use]
+    pub fn serves_model(&self, model_id: &str) -> bool {
+        self.route(model_id).is_some()
     }
 
     /// Record a turn, complaining on stderr rather than failing the request when
@@ -347,24 +427,24 @@ async fn models(State(state): State<ServerState>, headers: HeaderMap) -> Respons
     if !authorized(&state, &headers) {
         return unauthorized();
     }
-    // Both entries are the same page; `deepseek-pro` is the chat with the page's
-    // reasoning mode engaged. What a model costs is answered here, in the one
-    // place a caller asks, and it is always the same non-empty string.
-    //
-    // Deliberately absent: `context_length` and `max_output`. The page's real
-    // limits are not knowable from the outside, and a made-up number would be a
-    // claim this wrapper cannot support.
+    // The catalog is the configured providers' models. What a model costs is
+    // answered here, in the one place a caller asks, and it is always the same
+    // non-empty string. Deliberately absent: `context_length` and `max_output`
+    // — the page's real limits are not knowable from the outside, and a made-up
+    // number would be a claim this wrapper cannot support.
     let fetched_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
-    let data: Vec<Value> = [MODEL_ID, PRO_MODEL_ID]
-        .into_iter()
-        .map(|id| {
+    let data: Vec<Value> = state
+        .routes
+        .iter()
+        .map(|(id, route)| {
             json!({
                 "id": id,
                 "object": "model",
-                "owned_by": "deepseek-chat-web",
+                "owned_by": route.owned_by,
+                "name": route.name,
                 "pricing": PRICING_LABEL,
                 // Numeric companions, for a caller that only understands a rate.
                 // Zero, because on this route there is no per-token bill.
@@ -391,7 +471,7 @@ async fn completions(
     if !authorized(&state, &headers) {
         return unauthorized();
     }
-    if !serves_model(&request.model) {
+    if state.route(&request.model).is_none() {
         return api_error(StatusCode::BAD_REQUEST, "unknown wrapper model");
     }
     if let Err(message) = validate_request(&request) {
@@ -638,7 +718,10 @@ async fn relay_turn(
     request: &CompletionRequest,
     snapshots: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<Value, (StatusCode, String)> {
-    let mut relay = state.relay.lock().await;
+    let route = state
+        .route(&request.model)
+        .ok_or((StatusCode::BAD_REQUEST, "unknown wrapper model".to_owned()))?;
+    let mut relay = route.relay.lock().await;
     if let Some(assistant) = relay.replay(request) {
         return Ok(assistant);
     }
@@ -668,17 +751,17 @@ async fn relay_turn(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
-    // The model that answers is decided by the page's own reasoning state, so a
-    // pro request is page state, set before the turn starts. A wrapper that
-    // cannot set it fails the turn instead of answering as the wrong model.
-    if let Err(error) = state.ui.set_reasoning(request.model == PRO_MODEL_ID).await {
+    // The model that answers is decided by the page's own state (a reasoning
+    // chip, a dropdown), set before the turn starts. A wrapper that cannot set
+    // it fails the turn instead of answering as the wrong model.
+    if let Err(error) = route.ui.set_model_state(&route.toggles).await {
         state.record_failure(Failure::request(error.clone())).await;
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     let raw = match match snapshots {
-        Some(snapshots) => state.ui.send_streaming(&prompt, reset, snapshots).await,
-        None => state.ui.send(&prompt, reset).await,
+        Some(snapshots) => route.ui.send_streaming(&prompt, reset, snapshots).await,
+        None => route.ui.send(&prompt, reset).await,
     } {
         Ok(raw) => {
             // A reply that is neither a tool call nor a marked final answer is the
@@ -705,7 +788,7 @@ async fn relay_turn(
                         "browser_response": raw.clone(),
                     }))
                     .await;
-                match state.ui.send(&repair, false).await {
+                match route.ui.send(&repair, false).await {
                     Ok(retry) => retry,
                     // The first reply is all there is. Better delivered than lost.
                     Err(_) => raw,
@@ -717,7 +800,7 @@ async fn relay_turn(
             eprintln!("freechatcode: browser relay failed: {error}");
             // Ask the transport what actually happened before blaming anyone: a
             // dead uplink is not the chat service's fault.
-            let failure = match state.ui.diagnose(&error).await {
+            let failure = match route.ui.diagnose(&error).await {
                 Some(failure) => failure,
                 None => Failure::unknown(error.clone()),
             };
@@ -750,7 +833,7 @@ async fn relay_turn(
         .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
     // Which model the page used is not an API fact; record what the UI showed so
     // a conversation can be attributed model-by-model after the fact.
-    let model_label = state.ui.model_label().await;
+    let model_label = route.ui.model_label().await;
     let turn = TurnRecord {
         model_label: model_label.clone(),
         finish_reason: if assistant.get("tool_calls").is_some() {
@@ -2225,13 +2308,31 @@ mod tests {
     #[tokio::test]
     async fn both_models_are_advertised_with_a_price_that_is_never_unknown() {
         install_crypto_provider();
-        let state = ServerState::new(
+        let ui = Arc::new(FakeUi {
+            replies: StdMutex::new(Vec::new()),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
             "secret",
-            Arc::new(FakeUi {
-                replies: StdMutex::new(Vec::new()),
-                prompts: StdMutex::new(Vec::new()),
-            }),
+            vec![RouteGroup {
+                ui,
+                models: vec![
+                    ModelSpec {
+                        id: MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: PRO_MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
             Arc::new(FakeAudit),
+            BridgeOptions::default(),
         );
         let address = serve(state).await;
         let body: Value = reqwest::Client::new()
@@ -2274,22 +2375,66 @@ mod tests {
 
     #[test]
     fn only_the_models_this_wrapper_serves_are_accepted() {
-        assert!(serves_model(MODEL_ID));
-        assert!(serves_model(PRO_MODEL_ID));
-        assert!(!serves_model("gpt-5.5"));
-        assert!(!serves_model(""));
+        let ui: Arc<dyn ChatUi> = Arc::new(FakeUi {
+            replies: StdMutex::new(Vec::new()),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
+            "secret",
+            vec![RouteGroup {
+                ui,
+                models: vec![
+                    ModelSpec {
+                        id: MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: PRO_MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
+            Arc::new(FakeAudit),
+            BridgeOptions::default(),
+        );
+        assert!(state.serves_model(MODEL_ID));
+        assert!(state.serves_model(PRO_MODEL_ID));
+        assert!(!state.serves_model("gpt-5.5"));
+        assert!(!state.serves_model(""));
     }
 
     #[tokio::test]
     async fn the_pro_model_is_served_and_a_stranger_is_still_refused() {
         install_crypto_provider();
-        let state = ServerState::new(
+        let ui = Arc::new(FakeUi {
+            replies: StdMutex::new(vec!["ok".to_owned()]),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
             "secret",
-            Arc::new(FakeUi {
-                replies: StdMutex::new(vec!["ok".to_owned()]),
-                prompts: StdMutex::new(Vec::new()),
-            }),
+            vec![RouteGroup {
+                ui,
+                models: vec![
+                    ModelSpec {
+                        id: MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: PRO_MODEL_ID.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
             Arc::new(FakeAudit),
+            BridgeOptions::default(),
         );
         let address = serve(state).await;
 

@@ -48,8 +48,7 @@ pub fn migrate_legacy_home(home: &Path) {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub chat: ChatConfig,
-    pub selectors: Selectors,
+    pub providers: Vec<Provider>,
     pub timeouts: Timeouts,
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -147,6 +146,45 @@ pub struct Selectors {
     /// the model as "unknown".
     #[serde(default)]
     pub model_label: String,
+}
+
+/// One free chat site the wrapper can drive: its URL, its DOM selectors, and
+/// the models it exposes (each model being page state — a toggle, a dropdown —
+/// on top of that one site).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    pub chat: ChatConfig,
+    pub selectors: Selectors,
+    /// Models served by this provider. Empty is allowed (nothing is served).
+    #[serde(default)]
+    pub models: Vec<ProviderModel>,
+}
+
+/// One model a provider exposes. A model is not necessarily a separate thread:
+/// it is a name plus the page state that selects it (e.g. DeepSeek's DeepThink
+/// chip). Two models on one provider share one conversation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Page controls to set before a turn. Empty means "the provider's plain
+    /// model". For DeepSeek, the reasoner is the plain model with the DeepThink
+    /// control engaged.
+    #[serde(default)]
+    pub toggles: Vec<Toggle>,
+}
+
+/// A page control and the state it should be in for a model.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Toggle {
+    /// Selector of the control to click.
+    pub selector: String,
+    /// Whether the control should be on (`true`) or off (`false`).
+    #[serde(default = "default_true")]
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -593,6 +631,46 @@ impl Config {
         toml::from_str(DEFAULT_CONFIG_TOML).expect("embedded default config is valid TOML")
     }
 
+    /// The provider named `id`, if configured.
+    #[must_use]
+    pub fn provider(&self, id: &str) -> Option<&Provider> {
+        self.providers.iter().find(|provider| provider.id == id)
+    }
+
+    /// The provider and model that serve `model_id`, if any.
+    #[must_use]
+    pub fn model(&self, model_id: &str) -> Option<(&Provider, &ProviderModel)> {
+        for provider in &self.providers {
+            if let Some(model) = provider.models.iter().find(|model| model.id == model_id) {
+                return Some((provider, model));
+            }
+        }
+        None
+    }
+
+    /// Every model this config serves, as `(model_id, provider_id)`.
+    #[must_use]
+    pub fn all_models(&self) -> Vec<(String, String)> {
+        self.providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .map(move |model| (model.id.clone(), provider.id.clone()))
+            })
+            .collect()
+    }
+
+    /// The first model of the first provider, used when no `--model` is given.
+    #[must_use]
+    pub fn default_model_id(&self) -> Option<&str> {
+        self.providers
+            .first()
+            .and_then(|provider| provider.models.first())
+            .map(|model| model.id.as_str())
+    }
+
     /// Load defaults, deep-merged with the user config at `user_path` when it
     /// exists. A missing user config is not an error.
     pub fn load(user_path: Option<&Path>) -> Result<Self, String> {
@@ -782,20 +860,50 @@ mod tests {
     #[test]
     fn embedded_defaults_parse() {
         let config = Config::defaults();
-        assert_eq!(config.chat.url, "https://chat.deepseek.com");
+        assert_eq!(config.providers[0].chat.url, "https://chat.deepseek.com");
         assert!(
-            config
+            config.providers[0]
                 .chat
                 .allowed_hosts
                 .contains(&"chat.deepseek.com".to_owned())
         );
-        assert!(config.selectors.composer.contains("textarea"));
+        assert!(config.providers[0].selectors.composer.contains("textarea"));
         assert_eq!(config.timeouts.login_wait_secs, 900);
         assert!(config.codewhale.binary.is_none());
         assert!(config.codewhale.system_prompt.is_none());
         assert!(config.tools.forward_all);
         assert_eq!(config.tools.search, vec!["tool_search".to_owned()]);
         assert!(config.tools.essential.is_empty());
+    }
+
+    #[test]
+    fn providers_carry_models_and_toggles() {
+        let config = Config::defaults();
+        let provider = &config.providers[0];
+        assert_eq!(provider.id, "deepseek");
+        assert_eq!(provider.models.len(), 2);
+
+        let chat = &provider.models[0];
+        assert_eq!(chat.id, "deepseek-chat");
+        assert_eq!(chat.toggles.len(), 1);
+        assert!(
+            !chat.toggles[0].on,
+            "the plain model must explicitly disengage DeepThink"
+        );
+
+        let pro = &provider.models[1];
+        assert_eq!(pro.id, "deepseek-pro");
+        assert!(pro.toggles[0].on);
+
+        // Model lookup resolves across providers and picks a default.
+        assert_eq!(
+            config
+                .model("deepseek-chat")
+                .map(|(p, m)| (p.id.as_str(), m.id.as_str())),
+            Some(("deepseek", "deepseek-chat"))
+        );
+        assert_eq!(config.default_model_id(), Some("deepseek-chat"));
+        assert_eq!(config.all_models().len(), 2);
     }
 
     #[test]
@@ -1017,26 +1125,21 @@ mod tests {
         std::fs::write(
             &path,
             r##"
-            [chat]
-            url = "https://chat.deepseek.com/custom"
-            [selectors]
-            composer = "#my-composer"
             [codewhale]
             binary = "/opt/codewhale"
+            [timeouts]
+            login_wait_secs = 30
             "##,
         )
         .expect("write user config");
 
         let config = Config::load(Some(&path)).expect("load");
-        assert_eq!(config.chat.url, "https://chat.deepseek.com/custom");
-        assert_eq!(config.selectors.composer, "#my-composer");
-        // Untouched values keep their committed defaults.
-        assert!(config.selectors.assistant.contains("ds-markdown"));
-        assert_eq!(
-            config.chat.allowed_hosts,
-            vec!["chat.deepseek.com".to_owned()]
-        );
         assert_eq!(config.codewhale.binary.as_deref(), Some("/opt/codewhale"));
+        assert_eq!(config.timeouts.login_wait_secs, 30);
+        // Untouched values keep their committed defaults.
+        assert_eq!(config.timeouts.response_secs, 300);
+        assert!(config.tools.forward_all);
+        assert_eq!(config.providers[0].chat.url, "https://chat.deepseek.com");
     }
 
     #[test]
@@ -1044,29 +1147,52 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("nope.toml");
         let config = Config::load(Some(&missing)).expect("load");
-        assert_eq!(config.chat.url, Config::defaults().chat.url);
+        assert_eq!(
+            config.providers[0].chat.url,
+            Config::defaults().providers[0].chat.url
+        );
     }
 
     #[test]
     fn url_acceptance_is_config_driven() {
         let config = Config::defaults();
-        assert!(config.chat.accepts_url("https://chat.deepseek.com/"));
-        assert!(!config.chat.accepts_url("http://chat.deepseek.com/"));
-        assert!(!config.chat.accepts_url("https://deepseek.ai/chat"));
         assert!(
-            !config
+            config.providers[0]
+                .chat
+                .accepts_url("https://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("http://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://deepseek.ai/chat")
+        );
+        assert!(
+            !config.providers[0]
                 .chat
                 .accepts_url("https://chat.deepseek.com.attacker.invalid/")
         );
-        assert!(!config.chat.accepts_url("https://user@chat.deepseek.com/"));
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://user@chat.deepseek.com/")
+        );
     }
 
     #[test]
     fn resumable_url_requires_a_routed_path() {
         let config = Config::defaults();
-        assert!(!config.chat.is_resumable_url("https://chat.deepseek.com"));
         assert!(
-            config
+            !config.providers[0]
+                .chat
+                .is_resumable_url("https://chat.deepseek.com")
+        );
+        assert!(
+            config.providers[0]
                 .chat
                 .is_resumable_url("https://chat.deepseek.com/a/chat/s/abc123")
         );
@@ -1076,12 +1202,12 @@ mod tests {
     fn remember_binary_creates_and_preserves_other_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[chat]\nurl = \"https://chat.deepseek.com/x\"\n").expect("seed");
+        std::fs::write(&path, "[timeouts]\nlogin_wait_secs = 42\n").expect("seed");
 
         remember_binary(&path, Path::new("/opt/codewhale")).expect("remember");
         let config = Config::load(Some(&path)).expect("load");
         assert_eq!(config.codewhale.binary.as_deref(), Some("/opt/codewhale"));
-        assert_eq!(config.chat.url, "https://chat.deepseek.com/x");
+        assert_eq!(config.timeouts.login_wait_secs, 42);
 
         // Idempotent when the value is unchanged.
         remember_binary(&path, Path::new("/opt/codewhale")).expect("remember again");

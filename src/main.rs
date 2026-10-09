@@ -22,16 +22,16 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use freechatcode::config::{
-    self, ApiTransportConfig, BrowserMode, ChatConfig, Config, RunMode, Selectors, Timeouts,
-    TransportMode,
+    self, ApiTransportConfig, BrowserMode, ChatConfig, Config, Provider, RunMode, Selectors,
+    Timeouts, Toggle, TransportMode,
 };
 use freechatcode::harness::{self, HarnessKind};
 use freechatcode::health;
 use freechatcode::sessions::{self, SessionLinks, TurnRow};
 use freechatcode::setup;
 use freechatcode::{
-    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, MODEL_ID, PRO_MODEL_ID,
-    ServerState, ToolPolicy, TurnRecord, TurnSink, extract_api_text, router, serves_model,
+    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, ModelSpec, RouteGroup,
+    ServerState, ToolPolicy, TurnRecord, TurnSink, extract_api_text, router,
 };
 
 mod tui;
@@ -119,6 +119,7 @@ enum Commands {
 #[derive(Clone)]
 struct BrowserSpec {
     config: Config,
+    provider: Provider,
     url: String,
     profile: PathBuf,
     cdp_endpoint: Option<String>,
@@ -232,7 +233,7 @@ struct BrowserChat {
 
 impl BrowserChat {
     fn selectors(&self) -> &Selectors {
-        &self.spec.config.selectors
+        &self.spec.provider.selectors
     }
 
     fn timeouts(&self) -> &Timeouts {
@@ -275,7 +276,7 @@ impl BrowserChat {
             .context("attach to an existing Chromium context")?;
         let page = match context.pages().into_iter().next() {
             Some(page) => {
-                if !self.spec.config.chat.accepts_url(&page.url()) {
+                if !self.spec.provider.chat.accepts_url(&page.url()) {
                     self.navigate(&page).await?;
                 }
                 page
@@ -386,7 +387,7 @@ impl BrowserChat {
             };
             match self.wait_for_composer(&page, probe).await {
                 Ok(()) => {
-                    if !config.chat.accepts_url(&page.url()) {
+                    if !self.spec.provider.chat.accepts_url(&page.url()) {
                         bail!(
                             "the authenticated browser did not return to an allowed DeepSeek Chat page"
                         );
@@ -442,7 +443,7 @@ impl BrowserChat {
     /// Whether the visible page is a real, populated conversation on an allowed
     /// host — i.e. safe to continue in rather than realign from scratch.
     async fn conversation_present(&self, page: &Page) -> bool {
-        let chat = &self.spec.config.chat;
+        let chat = &self.spec.provider.chat;
         let deadline = Instant::now() + self.timeouts().link_probe();
         let poll = self.timeouts().poll();
         loop {
@@ -528,7 +529,7 @@ impl BrowserChat {
     /// instead of starting a new chat.
     async fn remember_conversation(&self, page: &Page) {
         let url = page.url();
-        if self.spec.config.chat.is_resumable_url(&url) {
+        if self.spec.provider.chat.is_resumable_url(&url) {
             *self.resume_url.lock().await = url;
         }
     }
@@ -652,7 +653,7 @@ impl BrowserChat {
     /// Whether the chat host resolves and accepts a connection, without the
     /// browser. Run off the async runtime, since DNS and connect block.
     async fn probe_reachability(&self) -> Reachability {
-        let host = url::Url::parse(&self.spec.config.chat.url)
+        let host = url::Url::parse(&self.spec.provider.chat.url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_owned));
         let Some(host) = host else {
@@ -1022,7 +1023,7 @@ impl BrowserChat {
     /// only hunted down when navigation leaves us inside a conversation. Hunting
     /// for the control first cost ~5s on every fresh turn.
     async fn start_new_chat(&self, page: &Page) -> Result<(), String> {
-        let chat = &self.spec.config.chat;
+        let chat = &self.spec.provider.chat;
         if !chat.is_resumable_url(&page.url()) {
             // Already on the bare chat URL: this is a new conversation already.
             return Ok(());
@@ -1301,60 +1302,55 @@ impl ChatUi for BrowserChat {
         self.model_label.lock().await.clone()
     }
 
-    /// Make the page's reasoning state match the model this turn asked for.
+    /// Make the page's state match the model this turn asked for.
     ///
-    /// Declarative, not a toggle: the wrapper advertises two models and which one
-    /// answers is page state, so a pro turn must not leak into the chat turn
-    /// after it and a chat turn must not inherit a pro one. A pro turn that
-    /// cannot engage the control fails — answering with the plain model while the
-    /// turn log says pro would be a lie.
-    async fn set_reasoning(&self, pro: bool) -> Result<(), String> {
-        let selector = self.selectors().thinking_toggle.trim().to_owned();
+    /// Declarative, not a toggle: a model is page state (a reasoning chip, a
+    /// dropdown), so a pro turn must not leak into the chat turn after it and a
+    /// chat turn must not inherit a pro one. A model that cannot engage a
+    /// required control fails — answering with the plain model while the turn
+    /// log says pro would be a lie.
+    async fn set_model_state(&self, toggles: &[Toggle]) -> Result<(), String> {
         let mut guard = self.session.lock().await;
         let session = guard.as_mut().ok_or("the browser is not open")?;
         let page = &session.page;
-        if selector.is_empty() {
-            return if pro {
-                Err(
-                    "[selectors] thinking_toggle is empty, so the pro model cannot be engaged"
-                        .to_owned(),
-                )
-            } else {
-                Ok(())
-            };
-        }
-        let control = page.locator(&selector).first();
-        if !control.is_visible().await.unwrap_or(false) {
-            return if pro {
-                Err(format!(
-                    "no visible DeepThink control on the page ({selector}); check \
-                     [selectors] thinking_toggle"
-                ))
-            } else {
-                // Nothing to settle: a page without the control answers with the
-                // plain model anyway.
-                Ok(())
-            };
-        }
-        let engaged = chip_is_selected(page, &selector).await;
-        if engaged == Some(pro) {
-            return Ok(());
-        }
-        tokio::time::timeout(self.timeouts().action(), control.click(None))
-            .await
-            .map_err(|_| "clicking the DeepThink control timed out".to_owned())?
-            .map_err(|error| format!("could not click the DeepThink control: {error}"))?;
-        // A click is a request, not a fact. Read it back before believing it.
-        let after = chip_is_selected(page, &selector).await;
-        if after != Some(pro) {
-            return Err(format!(
-                "the DeepThink control did not {}{}",
-                if pro { "engage" } else { "disengage" },
-                match after {
-                    Some(_) => " (it read back unchanged)",
-                    None => " (its state could not be read back)",
+        for toggle in toggles {
+            let selector = toggle.selector.trim().to_owned();
+            if selector.is_empty() {
+                if toggle.on {
+                    return Err("a model toggle has an empty selector".to_owned());
                 }
-            ));
+                continue;
+            }
+            let control = page.locator(&selector).first();
+            if !control.is_visible().await.unwrap_or(false) {
+                if toggle.on {
+                    return Err(format!(
+                        "no visible control on the page ({selector}); check the provider's toggle selectors"
+                    ));
+                }
+                // Nothing to settle: a page without the control is already "off".
+                continue;
+            }
+            let engaged = chip_is_selected(page, &selector).await;
+            if engaged == Some(toggle.on) {
+                continue;
+            }
+            tokio::time::timeout(self.timeouts().action(), control.click(None))
+                .await
+                .map_err(|_| format!("clicking the control ({selector}) timed out"))?
+                .map_err(|error| format!("could not click the control ({selector}): {error}"))?;
+            // A click is a request, not a fact. Read it back before believing it.
+            let after = chip_is_selected(page, &selector).await;
+            if after != Some(toggle.on) {
+                return Err(format!(
+                    "the control ({selector}) did not {}{}",
+                    if toggle.on { "engage" } else { "disengage" },
+                    match after {
+                        Some(_) => " (it read back unchanged)",
+                        None => " (its state could not be read back)",
+                    }
+                ));
+            }
         }
         Ok(())
     }
@@ -1814,15 +1810,37 @@ async fn run() -> Result<()> {
         config.browser.record_video_size = Some(size);
     }
 
+    // Resolve the model and its provider for this run. One tab per run for now:
+    // `--model` picks a model (and therefore its provider), otherwise the first
+    // model of the first provider is used. All of that provider's models are
+    // served; multi-provider multi-tab is a follow-up.
+    let model_id = args
+        .model
+        .clone()
+        .or_else(|| config.default_model_id().map(str::to_owned))
+        .context("no provider or model is configured")?;
+    let (active_provider, _) = config.model(&model_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--model must name a configured model (got {model_id}); configured: {}",
+            config
+                .all_models()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let provider = active_provider.clone();
+
     // Effective values: CLI flag > environment (merged by clap) > config > default.
     let chat_url = args
         .chat_url
         .clone()
-        .unwrap_or_else(|| config.chat.url.clone());
-    if !config.chat.accepts_url(&chat_url) {
+        .unwrap_or_else(|| provider.chat.url.clone());
+    if !provider.chat.accepts_url(&chat_url) {
         bail!(
             "--chat-url must be HTTPS on one of: {}",
-            config.chat.allowed_hosts.join(", ")
+            provider.chat.allowed_hosts.join(", ")
         );
     }
     if config.transport.mode == TransportMode::Api && config.transport.api.url.trim().is_empty() {
@@ -1889,7 +1907,7 @@ async fn run() -> Result<()> {
     let linked_url = session
         .as_ref()
         .and_then(|id| links.get(id).ok().flatten())
-        .filter(|url| config.chat.is_resumable_url(url));
+        .filter(|url| provider.chat.is_resumable_url(url));
     let had_link = linked_url.is_some();
     if let Some(url) = &linked_url {
         println!("Resuming the DeepSeek Chat conversation linked to this Codewhale session: {url}");
@@ -1901,6 +1919,7 @@ async fn run() -> Result<()> {
     let browser = Arc::new(BrowserChat {
         spec: BrowserSpec {
             config: config.clone(),
+            provider: provider.clone(),
             url: open_url,
             profile,
             cdp_endpoint,
@@ -1999,7 +2018,7 @@ async fn run() -> Result<()> {
         session: session.clone(),
         sessions_dir,
         workspace,
-        chat: config.chat.clone(),
+        chat: provider.chat.clone(),
         linked: AtomicBool::new(false),
         stale_link: Arc::clone(&stale_link),
     });
@@ -2029,10 +2048,23 @@ async fn run() -> Result<()> {
         None => DEFAULT_SYSTEM_PROMPT.to_owned(),
     };
     let system_prompt: Arc<str> = Arc::from(template.replace("{project_dir}", &project_dir));
+    let route_models: Vec<ModelSpec> = provider
+        .models
+        .iter()
+        .map(|model| ModelSpec {
+            id: model.id.clone(),
+            owned_by: provider.id.clone(),
+            name: model.name.clone(),
+            toggles: model.toggles.clone(),
+        })
+        .collect();
     let app = router(
-        ServerState::with_options(
+        ServerState::with_routes(
             token.clone(),
-            ui.clone(),
+            vec![RouteGroup {
+                ui: ui.clone(),
+                models: route_models,
+            }],
             audit,
             BridgeOptions {
                 tools: tool_policy,
@@ -2045,14 +2077,6 @@ async fn run() -> Result<()> {
     );
     let server = tokio::spawn(async move { serve(listener, app).await });
     let base_url = format!("http://{address}/v1");
-
-    let model_id = args.model.clone().unwrap_or_else(|| MODEL_ID.to_owned());
-    if !serves_model(&model_id) {
-        bail!(
-            "--model must be one of: {}",
-            [MODEL_ID, PRO_MODEL_ID].join(", ")
-        );
-    }
 
     println!("Starting Codewhale with the DeepSeek Chat browser route.");
     println!("The local relay listens only on {address}; no browser CORS access is enabled.");
@@ -2164,20 +2188,37 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freechatcode::{MODEL_ID, PRO_MODEL_ID};
 
     #[test]
     fn chat_url_acceptance_follows_config() {
         let config = Config::defaults();
-        assert!(config.chat.accepts_url("https://chat.deepseek.com/"));
-        assert!(!config.chat.accepts_url("http://chat.deepseek.com/"));
         assert!(
-            !config
+            config.providers[0]
+                .chat
+                .accepts_url("https://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("http://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
                 .chat
                 .accepts_url("https://chat.deepseek.com.attacker.invalid/")
         );
-        assert!(!config.chat.accepts_url("https://user@chat.deepseek.com/"));
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://user@chat.deepseek.com/")
+        );
         // The old deepseek.ai host is no longer trusted by default.
-        assert!(!config.chat.accepts_url("https://deepseek.ai/chat"));
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://deepseek.ai/chat")
+        );
     }
 
     #[test]
@@ -2223,7 +2264,7 @@ mod tests {
 
     #[test]
     fn default_selectors_support_a_test_page_without_platform_private_endpoints() {
-        let selectors = Config::defaults().selectors;
+        let selectors = Config::defaults().providers[0].selectors.clone();
         assert!(selectors.composer.contains("textarea"));
         assert!(selectors.assistant.contains("ds-markdown"));
         assert!(selectors.send.contains("send"));
@@ -2296,6 +2337,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2373,6 +2415,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2436,6 +2479,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2547,7 +2591,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -2686,7 +2731,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -2851,7 +2897,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -2877,9 +2924,12 @@ mod tests {
 
         eprintln!("[pro] page chips at rest: {:?}", chips(&ui, &page).await);
 
-        ui.set_reasoning(false)
-            .await
-            .expect("the chat model must be reachable");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("the chat model must be reachable");
         let chat = chips(&ui, &page).await;
         eprintln!("[pro] after chat: {chat:?}");
         assert!(
@@ -2887,9 +2937,12 @@ mod tests {
             "the plain chat model must leave DeepThink off, saw {chat:?}"
         );
 
-        ui.set_reasoning(true)
-            .await
-            .expect("the pro model must engage");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: true,
+        }])
+        .await
+        .expect("the pro model must engage");
         let pro = chips(&ui, &page).await;
         eprintln!("[pro] after pro: {pro:?}");
         assert!(
@@ -2912,9 +2965,12 @@ mod tests {
         );
 
         // And back: a chat turn must not inherit pro.
-        ui.set_reasoning(false)
-            .await
-            .expect("disengaging must work too");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("disengaging must work too");
         let back = chips(&ui, &page).await;
         eprintln!("[pro] after switching back: {back:?}");
         assert!(
@@ -2925,7 +2981,7 @@ mod tests {
     }
 
     /// Live: the relay itself engages the pro mode. The test above drives
-    /// `set_reasoning` directly; this one goes through the real router, so the
+    /// `set_model_state` directly; this one goes through the real router, so the
     /// composition — a `deepseek-pro` request arriving over HTTP and leaving the
     /// page in DeepThink — is verified rather than assumed.
     #[tokio::test]
@@ -2939,7 +2995,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -2964,7 +3021,12 @@ mod tests {
             .clone();
         // Start from the plain chat model, so an engaged control can only be the
         // relay's doing.
-        ui.set_reasoning(false).await.expect("start in chat mode");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("start in chat mode");
         let before = chips(&ui, &page).await;
         eprintln!("[relay] chips before: {before:?}");
         assert!(!before.contains("DeepThink=on"), "{before:?}");
@@ -3054,7 +3116,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3196,7 +3259,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3252,7 +3316,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3277,10 +3342,18 @@ mod tests {
             .clone();
 
         // What the relay does for a `deepseek-pro` request, in order.
-        ui.set_reasoning(false).await.expect("start in chat mode");
-        ui.set_reasoning(true)
-            .await
-            .expect("the pro model must engage");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("start in chat mode");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: true,
+        }])
+        .await
+        .expect("the pro model must engage");
         let reply = ui
             .send(
                 "Reply with exactly the word THIRTEEN and nothing else.",
@@ -3322,7 +3395,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3422,7 +3496,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3817,7 +3892,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3873,7 +3949,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: Some("http://127.0.0.1:9222".to_owned()),
             },
@@ -4011,11 +4088,12 @@ mod tests {
     /// Build a `BrowserChat` that never opens anything, for classification tests.
     fn classifier_for(url: &str) -> BrowserChat {
         let mut config = Config::defaults();
-        config.chat.url = url.to_owned();
+        config.providers[0].chat.url = url.to_owned();
         BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: PathBuf::from("/nonexistent"),
                 cdp_endpoint: None,
             },
@@ -4123,7 +4201,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4147,7 +4226,7 @@ mod tests {
         let conversation = ui.live_url().await.expect("a live page");
         eprintln!("[persist] conversation={conversation}");
         assert!(
-            config.chat.is_resumable_url(&conversation),
+            config.providers[0].chat.is_resumable_url(&conversation),
             "a real turn must leave a conversation URL: {conversation}"
         );
 
@@ -4185,8 +4264,8 @@ mod tests {
     async fn live_inspect_page() {
         let home = default_home().expect("codewhale home");
         let config = Config::load(Some(&config::user_config_path(&home))).expect("config");
-        let url =
-            std::env::var("DEEPCHATCODE_INSPECT_URL").unwrap_or_else(|_| config.chat.url.clone());
+        let url = std::env::var("DEEPCHATCODE_INSPECT_URL")
+            .unwrap_or_else(|_| config.providers[0].chat.url.clone());
         let (_dir, profile) = profile_copy();
 
         let playwright = Playwright::launch().await.expect("Playwright driver");
@@ -4207,7 +4286,7 @@ mod tests {
         page.goto(&url, None).await.expect("navigate");
         tokio::time::sleep(Duration::from_secs(6)).await;
 
-        let assistants = page.locator(&config.selectors.assistant);
+        let assistants = page.locator(&config.providers[0].selectors.assistant);
         eprintln!(
             "[inspect] {url}\n[inspect] assistant elements: {}",
             assistants.count().await.unwrap_or(0)
@@ -4226,7 +4305,9 @@ mod tests {
                 text.chars().take(400).collect::<String>()
             );
         }
-        let composer = page.locator(&config.selectors.composer).first();
+        let composer = page
+            .locator(&config.providers[0].selectors.composer)
+            .first();
         eprintln!(
             "[inspect] composer visible: {} | enabled: {}",
             composer.is_visible().await.unwrap_or(false),
@@ -4236,7 +4317,7 @@ mod tests {
         // the DOM?", so print exactly what the page keeps mounted. A chat UI
         // that unmounts off-screen messages makes that count stop growing, and
         // this report is how that is diagnosed instead of guessed at.
-        for line in dom_outline(&page, &config.selectors).await {
+        for line in dom_outline(&page, &config.providers[0].selectors).await {
             eprintln!("[inspect] {line}");
         }
         let body = page
@@ -4274,7 +4355,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4302,13 +4384,13 @@ mod tests {
         let mut answered_without_growth = 0_usize;
         for turn in 1..=TURNS {
             let token = format!("W{turn}");
-            let before = mounted_count(&page, &config.selectors).await;
+            let before = mounted_count(&page, &config.providers[0].selectors).await;
             let started = std::time::Instant::now();
             let reply = ui
                 .send(&padded_prompt(&token), turn == 1)
                 .await
                 .unwrap_or_else(|error| panic!("turn {turn} failed: {error}"));
-            let after = mounted_count(&page, &config.selectors).await;
+            let after = mounted_count(&page, &config.providers[0].selectors).await;
             eprintln!(
                 "[window] turn {turn}: {:?} mounted assistant elements {before} -> {after}, reply={reply:?}",
                 started.elapsed()
@@ -4319,7 +4401,7 @@ mod tests {
             );
             if after <= before {
                 answered_without_growth += 1;
-                for line in dom_outline(&page, &config.selectors).await {
+                for line in dom_outline(&page, &config.providers[0].selectors).await {
                     eprintln!("[window]   {line}");
                 }
             }
@@ -4350,7 +4432,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4442,7 +4525,7 @@ mod tests {
         let linked = session
             .as_ref()
             .and_then(|id| links.get(id).ok().flatten())
-            .filter(|url| config.chat.is_resumable_url(url));
+            .filter(|url| config.providers[0].chat.is_resumable_url(url));
         eprintln!("[live] session={session:?}");
         eprintln!("[live] linked conversation={linked:?}");
         let start_fresh = linked.is_none();
@@ -4450,7 +4533,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: linked.unwrap_or_else(|| config.chat.url.clone()),
+                provider: config.providers[0].clone(),
+                url: linked.unwrap_or_else(|| config.providers[0].chat.url.clone()),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -4513,7 +4597,7 @@ mod tests {
         let conversation = ui.live_url().await.expect("a live page");
         eprintln!("[live] conversation url={conversation}");
         assert!(
-            config.chat.is_resumable_url(&conversation),
+            config.providers[0].chat.is_resumable_url(&conversation),
             "a real turn must leave a resumable conversation URL: {conversation}"
         );
         ui.shutdown().await;
@@ -4521,6 +4605,7 @@ mod tests {
         let resumed = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: conversation.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,

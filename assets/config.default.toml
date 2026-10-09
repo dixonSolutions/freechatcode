@@ -33,7 +33,13 @@
 # headless page and one line on stderr says so. The mode stays quiet either way.
 mode = "show"
 
-[chat]
+[[providers]]
+# One entry per free chat site. Each provider carries its own URL, selectors,
+# and the models it serves (a model is page state on top of the site).
+id = "deepseek"
+name = "DeepSeek Chat"
+
+[providers.chat]
 # Base chat URL. Naked form opens a brand-new conversation by default; the
 # wrapper navigates to a stored conversation URL instead when one is linked to
 # the active Codewhale session.
@@ -46,7 +52,7 @@ allowed_hosts = ["chat.deepseek.com"]
 # bare chat URL that would otherwise look "different enough" to store.
 routed_url_pattern = "/a/chat/s/"
 
-[selectors]
+[providers.selectors]
 composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
 assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
 send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
@@ -59,6 +65,19 @@ file_upload = "input[type='file'], button[aria-label*='upload' i], button[aria-l
 # is attributed to a model. Verified against chat.deepseek.com; set to "" to
 # disable, and the turn log records the model as "unknown".
 model_label = "div.ds-toggle-button"
+
+# The plain model must explicitly disengage DeepThink, so a pro turn never
+# leaks into the next chat turn (state is declared per model, not toggled).
+[[providers.models]]
+id = "deepseek-chat"
+name = "DeepSeek Chat"
+toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = false }]
+
+# The reasoning model is the same chat with the page's DeepThink control engaged.
+[[providers.models]]
+id = "deepseek-pro"
+name = "DeepSeek Pro"
+toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = true }]
 
 [timeouts]
 # How long to wait for the composer to appear (manual sign-in window).
