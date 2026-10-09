@@ -169,6 +169,8 @@ impl Failure {
 /// after the fact, and so a failure is a record rather than a silence.
 #[derive(Clone, Debug, Default)]
 pub struct TurnRecord {
+    /// The provider whose tab answered (or failed to answer) the turn.
+    pub provider_id: Option<String>,
     /// The model label the page showed for this turn, when it exposes one.
     pub model_label: Option<String>,
     /// `stop`, `tool_calls`, or `error`.
@@ -289,6 +291,9 @@ pub struct ModelSpec {
 #[derive(Clone)]
 pub struct RouteGroup {
     pub ui: Arc<dyn ChatUi>,
+    /// Whether this tab starts a fresh conversation (no linked conversation to
+    /// resume). When true the first turn feeds the whole transcript.
+    pub start_fresh: bool,
     pub models: Vec<ModelSpec>,
 }
 
@@ -323,7 +328,7 @@ impl ServerState {
     ) -> Self {
         let mut routes = Vec::new();
         for group in groups {
-            let relay = Arc::new(Mutex::new(ConversationRelay::new(options.start_fresh)));
+            let relay = Arc::new(Mutex::new(ConversationRelay::new(group.start_fresh)));
             for model in group.models {
                 routes.push((
                     model.id,
@@ -363,6 +368,7 @@ impl ServerState {
             token,
             vec![RouteGroup {
                 ui,
+                start_fresh: options.start_fresh,
                 models: vec![ModelSpec {
                     id: MODEL_ID.to_owned(),
                     owned_by: "test".to_owned(),
@@ -835,6 +841,7 @@ async fn relay_turn(
     // a conversation can be attributed model-by-model after the fact.
     let model_label = route.ui.model_label().await;
     let turn = TurnRecord {
+        provider_id: Some(route.owned_by.clone()),
         model_label: model_label.clone(),
         finish_reason: if assistant.get("tool_calls").is_some() {
             "tool_calls".to_owned()
@@ -2316,6 +2323,7 @@ mod tests {
             "secret",
             vec![RouteGroup {
                 ui,
+                start_fresh: false,
                 models: vec![
                     ModelSpec {
                         id: MODEL_ID.into(),
@@ -2383,6 +2391,7 @@ mod tests {
             "secret",
             vec![RouteGroup {
                 ui,
+                start_fresh: false,
                 models: vec![
                     ModelSpec {
                         id: MODEL_ID.into(),
@@ -2418,6 +2427,7 @@ mod tests {
             "secret",
             vec![RouteGroup {
                 ui,
+                start_fresh: false,
                 models: vec![
                     ModelSpec {
                         id: MODEL_ID.into(),

@@ -1449,6 +1449,7 @@ struct UrlLinkingChat {
     sessions_dir: PathBuf,
     workspace: PathBuf,
     chat: ChatConfig,
+    provider_id: String,
     linked: AtomicBool,
     /// Set by the startup warm-up when the linked conversation turned out not to
     /// exist. Checked once, on the first turn: the browser is warmed in parallel
@@ -1486,7 +1487,7 @@ impl UrlLinkingChat {
         let Some(session) = session else {
             return false;
         };
-        match self.links.upsert(&session, &url) {
+        match self.links.upsert(&session, &self.provider_id, &url) {
             Ok(()) => {
                 eprintln!("Linked Codewhale session {session} to {url}");
                 self.linked.store(true, Ordering::SeqCst);
@@ -1544,9 +1545,9 @@ struct TurnLog {
 #[async_trait::async_trait]
 impl TurnSink for TurnLog {
     async fn record(&self, turn: TurnRecord) -> Result<(), String> {
-        let chat_url = match self.session.as_deref() {
-            Some(session) => self.links.get(session).ok().flatten(),
-            None => None,
+        let chat_url = match (self.session.as_deref(), turn.provider_id.as_deref()) {
+            (Some(session), Some(provider)) => self.links.get(session, provider).ok().flatten(),
+            _ => None,
         };
         // A turn with no failure answered; a turn with one is recorded as failed
         // alongside the diagnosis, so the history says *whose* fault it was.
@@ -1705,6 +1706,25 @@ fn take_terminal_off_stdin() -> Option<std::fs::File> {
     }
 }
 
+/// One-time move of the first release's DeepSeek profile/audit directory into
+/// the per-provider layout, so a signed-in browser session is not lost.
+fn migrate_provider_dirs(home: &Path) {
+    let legacy = home.join("deepseek-chat");
+    let current = home.join("providers").join("deepseek");
+    if legacy.exists() && !current.exists() {
+        if let Some(parent) = current.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::rename(&legacy, &current) {
+            eprintln!(
+                "freechatcode: could not migrate {} to {}: {error}",
+                legacy.display(),
+                current.display()
+            );
+        }
+    }
+}
+
 fn default_home() -> Result<PathBuf> {
     let home = if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
         PathBuf::from(home)
@@ -1799,6 +1819,7 @@ async fn run() -> Result<()> {
     };
 
     let home = default_home()?;
+    migrate_provider_dirs(&home);
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -1874,20 +1895,14 @@ async fn run() -> Result<()> {
         eprintln!("freechatcode: could not remember the codewhale binary: {error}");
     }
 
-    let profile = args
-        .profile_dir
-        .clone()
-        .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from))
-        .unwrap_or_else(|| home.join("deepseek-chat").join("browser"));
     let cdp_endpoint = args
         .cdp_endpoint
         .clone()
         .or_else(|| config.browser.cdp_endpoint.clone());
+    // One audit log for the whole relay, however many providers are running.
+    let audit = JsonlAudit::create(&home.join("freechatcode").join("audit")).await?;
 
-    let audit = JsonlAudit::create(&home.join("deepseek-chat").join("audit")).await?;
-
-    // Resolve the Codewhale session this run will use, and the DeepSeek Chat
-    // conversation linked to it (if any).
+    // Resolve the Codewhale session this run will use (shared across providers).
     let workspace = std::env::current_dir().context("resolve the working directory")?;
     let project_dir = workspace.to_string_lossy().into_owned();
     let sessions_dir = home.join("sessions");
@@ -1902,126 +1917,162 @@ async fn run() -> Result<()> {
         }
         Intent::Auto => sessions::resolve_session_id(&sessions_dir, &workspace, None),
     };
-    // A stored link is only trusted if it is still a resumable URL on an
-    // allowed host; anything else is treated as no link at all.
-    let linked_url = session
-        .as_ref()
-        .and_then(|id| links.get(id).ok().flatten())
-        .filter(|url| provider.chat.is_resumable_url(url));
-    let had_link = linked_url.is_some();
-    if let Some(url) = &linked_url {
-        println!("Resuming the DeepSeek Chat conversation linked to this Codewhale session: {url}");
-    } else if session.is_some() {
-        println!("No linked conversation yet; opening a new DeepSeek Chat session.");
-    }
-    let open_url = linked_url.unwrap_or_else(|| chat_url.clone());
 
-    let browser = Arc::new(BrowserChat {
-        spec: BrowserSpec {
-            config: config.clone(),
-            provider: provider.clone(),
-            url: open_url,
-            profile,
-            cdp_endpoint,
-        },
-        session: Mutex::new(None),
-        transport: config.transport.mode,
-        api: config.transport.api.clone(),
-        api_timeout: Duration::from_secs(config.transport.api.timeout_secs.max(1)),
-        keep_alive: config.browser.keep_alive,
-        response_timeout: config.timeouts.response(),
-        model_label: Mutex::new(None),
-        resume_url: Mutex::new(String::new()),
-        last_http_status: Mutex::new(None),
-    });
-    // Take the terminal off the wrapper's stdin *before* the browser exists, so
+    // Take the terminal off the wrapper's stdin *before* any browser exists, so
     // the driver library has nothing to snapshot and nothing to write back onto
     // the TUI's line discipline. See `take_terminal_off_stdin`.
     let terminal = take_terminal_off_stdin();
-    // Warm the browser *while* Codewhale boots rather than before it. Nothing
-    // needs the page until the first turn, and waiting here put the whole cold
-    // start — Playwright driver, Chromium, navigation, the composer probe — in
-    // front of the TUI the user is watching. The diagnosis is not traded away:
-    // a browser that cannot come up still stops the run with the same classified
-    // message and the same record, and it stops it as soon as the failure is
-    // known instead of after an arbitrary wait.
     let startup = std::time::Instant::now();
-    let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel::<String>();
-    let stale_link = Arc::new(AtomicBool::new(false));
-    {
-        let browser = Arc::clone(&browser);
-        let stale_link = Arc::clone(&stale_link);
-        let links = Arc::clone(&links);
-        let session = session.clone();
-        let notifications = config.relay.desktop_notifications;
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            if let Err(error) = browser.ensure_open().await {
-                // The bridge could not even get a browser. Say why, and record it:
-                // "it never started" is exactly the question a log should answer.
-                let failure = browser.classify(&error).await;
-                let (kind, blame) = (failure.kind.clone(), failure.blame.clone());
-                let startup_log: Arc<dyn TurnSink> = Arc::new(TurnLog {
-                    links: Arc::clone(&links),
-                    session: session.clone(),
-                });
-                let _ = startup_log
-                    .record(TurnRecord {
-                        finish_reason: "error".to_owned(),
-                        failure: Some(failure),
-                        ..TurnRecord::default()
-                    })
-                    .await;
-                let condensed = first_line(&error);
-                let more = if error.lines().count() > 1 {
-                    " (full text in the relay audit log)"
-                } else {
-                    ""
-                };
-                let _ = failed_tx.send(format!(
-                    "could not open the browser [{kind} / {blame}]: {condensed}{more}"
-                ));
-                return;
-            }
-            eprintln!(
-                "freechatcode: browser ready in {:.1}s",
-                started.elapsed().as_secs_f64()
+    let (failed_tx, mut failed_rx) =
+        tokio::sync::mpsc::channel::<String>(config.providers.len().max(1));
+
+    // One tab (and one conversation) per provider, all served by this one relay.
+    let mut route_groups: Vec<RouteGroup> = Vec::new();
+    let mut browsers: Vec<Arc<BrowserChat>> = Vec::new();
+    for entry in &config.providers {
+        let profile = args
+            .profile_dir
+            .clone()
+            .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from))
+            .unwrap_or_else(|| home.join("providers").join(&entry.id).join("browser"));
+        // `--chat-url` overrides the active provider's base URL; every other
+        // provider opens at its configured URL.
+        let base_url = if entry.id == provider.id {
+            chat_url.clone()
+        } else {
+            entry.chat.url.clone()
+        };
+        // A stored link is trusted only while it is still resumable on this
+        // provider's host; anything else is treated as no link at all.
+        let linked_url = session
+            .as_ref()
+            .and_then(|id| links.get(id, &entry.id).ok().flatten())
+            .filter(|url| entry.chat.is_resumable_url(url));
+        let had_link = linked_url.is_some();
+        if let Some(url) = &linked_url {
+            println!(
+                "Resuming the {} conversation linked to this Codewhale session: {url}",
+                entry.name
             );
-            // The Codewhale session is the source of truth: verify the linked
-            // conversation actually exists before trusting it. If it is gone,
-            // realign from scratch — a new chat, fed the whole session — and tell
-            // the user. Checked here because this is where the page exists.
-            if had_link && !browser.link_available().await {
-                stale_link.store(true, Ordering::SeqCst);
-                notify(
-                    notifications,
-                    "DeepSeek chat link is stale",
-                    "The linked conversation is no longer reachable. Opening a new chat and re-feeding the Codewhale session.",
+        } else if session.is_some() {
+            println!(
+                "No linked {} conversation yet; opening a new one.",
+                entry.name
+            );
+        }
+        let open_url = linked_url.unwrap_or(base_url);
+
+        let browser = Arc::new(BrowserChat {
+            spec: BrowserSpec {
+                config: config.clone(),
+                provider: entry.clone(),
+                url: open_url,
+                profile,
+                cdp_endpoint: cdp_endpoint.clone(),
+            },
+            session: Mutex::new(None),
+            transport: config.transport.mode,
+            api: config.transport.api.clone(),
+            api_timeout: Duration::from_secs(config.transport.api.timeout_secs.max(1)),
+            keep_alive: config.browser.keep_alive,
+            response_timeout: config.timeouts.response(),
+            model_label: Mutex::new(None),
+            resume_url: Mutex::new(String::new()),
+            last_http_status: Mutex::new(None),
+        });
+        browsers.push(Arc::clone(&browser));
+        let stale_link = Arc::new(AtomicBool::new(false));
+        {
+            let browser = Arc::clone(&browser);
+            let stale_link = Arc::clone(&stale_link);
+            let links = Arc::clone(&links);
+            let session = session.clone();
+            let notifications = config.relay.desktop_notifications;
+            let failed_tx = failed_tx.clone();
+            let provider_name = entry.name.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                if let Err(error) = browser.ensure_open().await {
+                    // "It never started" is exactly the question a log answers.
+                    let failure = browser.classify(&error).await;
+                    let (kind, blame) = (failure.kind.clone(), failure.blame.clone());
+                    let startup_log: Arc<dyn TurnSink> = Arc::new(TurnLog {
+                        links: Arc::clone(&links),
+                        session: session.clone(),
+                    });
+                    let _ = startup_log
+                        .record(TurnRecord {
+                            finish_reason: "error".to_owned(),
+                            failure: Some(failure),
+                            ..TurnRecord::default()
+                        })
+                        .await;
+                    let condensed = first_line(&error);
+                    let more = if error.lines().count() > 1 {
+                        " (full text in the relay audit log)"
+                    } else {
+                        ""
+                    };
+                    let _ = failed_tx
+                        .send(format!(
+                            "could not open the {provider_name} browser [{kind} / {blame}]: {condensed}{more}"
+                        ))
+                        .await;
+                    return;
+                }
+                eprintln!(
+                    "freechatcode: {provider_name} browser ready in {:.1}s",
+                    started.elapsed().as_secs_f64()
                 );
-            }
+                // The Codewhale session is the source of truth: verify the linked
+                // conversation still exists before trusting it.
+                if had_link && !browser.link_available().await {
+                    stale_link.store(true, Ordering::SeqCst);
+                    notify(
+                        notifications,
+                        &format!("{provider_name} chat link is stale"),
+                        "The linked conversation is no longer reachable. Opening a new chat and re-feeding the Codewhale session.",
+                    );
+                }
+            });
+        }
+
+        // Keep the browser alive between turns: a browser that is closed or
+        // crashes should come back on its own, not at the next prompt.
+        if config.browser.keep_alive && config.browser.liveness_check_secs > 0 {
+            let watcher = Arc::clone(&browser);
+            let interval = Duration::from_secs(config.browser.liveness_check_secs);
+            tokio::spawn(async move { watcher.watch_browser(interval).await });
+        }
+
+        let ui = Arc::new(UrlLinkingChat {
+            inner: Arc::clone(&browser),
+            links: Arc::clone(&links),
+            session: session.clone(),
+            sessions_dir: sessions_dir.clone(),
+            workspace: workspace.clone(),
+            chat: entry.chat.clone(),
+            provider_id: entry.id.clone(),
+            linked: AtomicBool::new(false),
+            stale_link: Arc::clone(&stale_link),
+        });
+        let models: Vec<ModelSpec> = entry
+            .models
+            .iter()
+            .map(|model| ModelSpec {
+                id: model.id.clone(),
+                owned_by: entry.id.clone(),
+                name: model.name.clone(),
+                toggles: model.toggles.clone(),
+            })
+            .collect();
+        route_groups.push(RouteGroup {
+            ui,
+            start_fresh: !had_link,
+            models,
         });
     }
 
-    // Keep the browser alive between turns: a browser that is closed or crashes
-    // should come back on its own, not at the next prompt.
-    if config.browser.keep_alive && config.browser.liveness_check_secs > 0 {
-        let watcher = Arc::clone(&browser);
-        let interval = Duration::from_secs(config.browser.liveness_check_secs);
-        tokio::spawn(async move { watcher.watch_browser(interval).await });
-    }
-
-    let start_fresh = !had_link;
-
-    let ui = Arc::new(UrlLinkingChat {
-        inner: Arc::clone(&browser),
-        links: Arc::clone(&links),
-        session: session.clone(),
-        sessions_dir,
-        workspace,
-        chat: provider.chat.clone(),
-        linked: AtomicBool::new(false),
-        stale_link: Arc::clone(&stale_link),
-    });
     let turns: Arc<dyn TurnSink> = Arc::new(TurnLog {
         links: Arc::clone(&links),
         session: session.clone(),
@@ -2048,27 +2099,16 @@ async fn run() -> Result<()> {
         None => DEFAULT_SYSTEM_PROMPT.to_owned(),
     };
     let system_prompt: Arc<str> = Arc::from(template.replace("{project_dir}", &project_dir));
-    let route_models: Vec<ModelSpec> = provider
-        .models
-        .iter()
-        .map(|model| ModelSpec {
-            id: model.id.clone(),
-            owned_by: provider.id.clone(),
-            name: model.name.clone(),
-            toggles: model.toggles.clone(),
-        })
-        .collect();
     let app = router(
         ServerState::with_routes(
             token.clone(),
-            vec![RouteGroup {
-                ui: ui.clone(),
-                models: route_models,
-            }],
+            route_groups,
             audit,
             BridgeOptions {
                 tools: tool_policy,
-                start_fresh,
+                // Per-tab freshness lives on each RouteGroup; this field only
+                // drives the single-tab convenience constructor.
+                start_fresh: false,
                 system_prompt,
                 forward_system_prompt: config.relay.forward_system_prompt,
             },
@@ -2078,7 +2118,7 @@ async fn run() -> Result<()> {
     let server = tokio::spawn(async move { serve(listener, app).await });
     let base_url = format!("http://{address}/v1");
 
-    println!("Starting Codewhale with the DeepSeek Chat browser route.");
+    println!("Starting Codewhale with the chat browser route.");
     println!("The local relay listens only on {address}; no browser CORS access is enabled.");
     println!("Platform credentials and cookies remain in the browser profile.");
     println!(
@@ -2146,12 +2186,12 @@ async fn run() -> Result<()> {
     let status = tokio::select! {
         status = child.wait() => status.context("wait for Codewhale")?,
         failure = async {
-            match (&mut failed_rx).await {
-                // Only an actual message is a failure. A sender dropped after a
+            match failed_rx.recv().await {
+                // Only an actual message is a failure. Senders dropped after a
                 // successful warm-up must not read as one, so this branch simply
                 // never resolves in that case.
-                Ok(message) => message,
-                Err(_) => std::future::pending::<String>().await,
+                Some(message) => message,
+                None => std::future::pending::<String>().await,
             }
         } => {
             // Codewhale is already up, but nothing can be answered without a
@@ -2160,7 +2200,9 @@ async fn run() -> Result<()> {
             child.kill().await.context("stop Codewhale")?;
             child.wait().await.context("reap Codewhale")?;
             server.abort();
-            browser.shutdown().await;
+            for browser in &browsers {
+                browser.shutdown().await;
+            }
             bail!("{failure}");
         }
         signal = tokio::signal::ctrl_c() => {
@@ -2170,7 +2212,9 @@ async fn run() -> Result<()> {
         }
     };
     server.abort();
-    browser.shutdown().await;
+    for browser in &browsers {
+        browser.shutdown().await;
+    }
     if !status.success() {
         bail!("Codewhale exited with {status}");
     }
@@ -4059,6 +4103,7 @@ mod tests {
             session: Some("sess-1".to_owned()),
         };
         log.record(TurnRecord {
+            provider_id: None,
             model_label: Some("DeepThink=off, Search=on".to_owned()),
             finish_reason: "error".to_owned(),
             tool_calls: false,
@@ -4524,7 +4569,7 @@ mod tests {
         let session = sessions::resolve_session_id(&sessions_dir, &workspace, None);
         let linked = session
             .as_ref()
-            .and_then(|id| links.get(id).ok().flatten())
+            .and_then(|id| links.get(id, "deepseek").ok().flatten())
             .filter(|url| config.providers[0].chat.is_resumable_url(url));
         eprintln!("[live] session={session:?}");
         eprintln!("[live] linked conversation={linked:?}");

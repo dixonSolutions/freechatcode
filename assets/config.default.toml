@@ -167,12 +167,12 @@ keep_alive = true
 # the check off. Ignored when keep_alive = false, where an absent browser is the
 # point.
 liveness_check_secs = 15
-# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# profile_dir = "/home/you/.codewhale/providers/deepseek/browser"
 # cdp_endpoint = "http://127.0.0.1:9222"
 # Record the managed browser's page to a video. One file per run, written when
 # the browser closes. Handy for demos and for seeing what the page did when a
 # turn failed. Never records the desktop — only the page the wrapper drives.
-# record_video_dir = "/home/you/.codewhale/deepseek-chat/video"
+# record_video_dir = "/home/you/.codewhale/freechatcode/video"
 # record_video_size = "1280x800"
 
 [transport]

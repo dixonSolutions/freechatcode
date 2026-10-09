@@ -31,7 +31,7 @@ binary = "/home/you/.cargo/bin/codewhale"
 # How often to check that the browser is still there while idle, and reopen it
 # on the conversation in progress if it is not. 0 disables the check.
 # liveness_check_secs = 15
-# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# profile_dir = "/home/you/.codewhale/providers/deepseek/browser"
 # cdp_endpoint = "http://127.0.0.1:9222"
 
 # How completions are delivered.
