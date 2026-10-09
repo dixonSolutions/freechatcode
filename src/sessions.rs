@@ -41,15 +41,17 @@ impl SessionLinks {
              -- than failing a turn over a lock.
              PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS chat_links (
-                 codewhale_session_id TEXT PRIMARY KEY,
-                 deepseek_chat_url    TEXT NOT NULL,
+                 codewhale_session_id TEXT NOT NULL,
+                 provider_id          TEXT NOT NULL,
+                 chat_url             TEXT NOT NULL,
                  created_at           INTEGER NOT NULL,
-                 updated_at           INTEGER NOT NULL
+                 updated_at           INTEGER NOT NULL,
+                 PRIMARY KEY (codewhale_session_id, provider_id)
              );
              CREATE TABLE IF NOT EXISTS chat_turns (
                  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
                  codewhale_session_id TEXT,
-                 deepseek_chat_url    TEXT,
+                 chat_url             TEXT,
                  model_label          TEXT,
                  finish_reason        TEXT,
                  tool_calls           INTEGER NOT NULL DEFAULT 0,
@@ -63,23 +65,27 @@ impl SessionLinks {
              );",
         )
         .map_err(|error| format!("initialise session database: {error}"))?;
+        migrate_links(&conn).map_err(|error| format!("migrate link table: {error}"))?;
         migrate_turns(&conn).map_err(|error| format!("migrate session database: {error}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// The linked conversation URL for `session_id`, if any.
-    pub fn get(&self, session_id: &str) -> Result<Option<String>, String> {
+    /// The linked conversation URL for `session_id` on `provider_id`, if any.
+    pub fn get(&self, session_id: &str, provider_id: &str) -> Result<Option<String>, String> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| "session database lock poisoned".to_owned())?;
         let mut statement = conn
-            .prepare("SELECT deepseek_chat_url FROM chat_links WHERE codewhale_session_id = ?1")
+            .prepare(
+                "SELECT chat_url FROM chat_links
+                 WHERE codewhale_session_id = ?1 AND provider_id = ?2",
+            )
             .map_err(|error| format!("prepare link lookup: {error}"))?;
         let mut rows = statement
-            .query([session_id])
+            .query([session_id, provider_id])
             .map_err(|error| format!("query link: {error}"))?;
         match rows.next().map_err(|error| format!("read link: {error}"))? {
             Some(row) => Ok(Some(
@@ -90,8 +96,8 @@ impl SessionLinks {
         }
     }
 
-    /// Insert or update the conversation URL for `session_id`.
-    pub fn upsert(&self, session_id: &str, url: &str) -> Result<(), String> {
+    /// Insert or update the conversation URL for `session_id` on `provider_id`.
+    pub fn upsert(&self, session_id: &str, provider_id: &str, url: &str) -> Result<(), String> {
         let now = unix_seconds();
         let conn = self
             .conn
@@ -99,12 +105,12 @@ impl SessionLinks {
             .map_err(|_| "session database lock poisoned".to_owned())?;
         conn.execute(
             "INSERT INTO chat_links
-                 (codewhale_session_id, deepseek_chat_url, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(codewhale_session_id) DO UPDATE SET
-                 deepseek_chat_url = excluded.deepseek_chat_url,
-                 updated_at        = excluded.updated_at",
-            rusqlite::params![session_id, url, now],
+                 (codewhale_session_id, provider_id, chat_url, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(codewhale_session_id, provider_id) DO UPDATE SET
+                 chat_url  = excluded.chat_url,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![session_id, provider_id, url, now],
         )
         .map_err(|error| format!("record link: {error}"))?;
         Ok(())
@@ -131,7 +137,7 @@ impl SessionLinks {
             .map_err(|_| "session database lock poisoned".to_owned())?;
         conn.execute(
             "INSERT INTO chat_turns
-                 (codewhale_session_id, deepseek_chat_url, model_label,
+                 (codewhale_session_id, chat_url, model_label,
                   finish_reason, tool_calls, content_chars, created_at,
                   outcome, failure_kind, blame, http_status, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -162,7 +168,7 @@ impl SessionLinks {
             .map_err(|_| "session database lock poisoned".to_owned())?;
         let mut statement = conn
             .prepare(
-                "SELECT codewhale_session_id, deepseek_chat_url, model_label,
+                "SELECT codewhale_session_id, chat_url, model_label,
                         finish_reason, tool_calls, content_chars, created_at,
                         outcome, failure_kind, blame, http_status, detail
                  FROM chat_turns ORDER BY id DESC LIMIT ?1",
@@ -191,17 +197,44 @@ impl SessionLinks {
     }
 }
 
-/// Add any column an older database is missing.
-///
-/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database
-/// written by an earlier build would silently lose the newer fields — exactly
-/// the kind of quiet data loss this table exists to prevent.
+/// Rebuild `chat_links` from the single-provider schema to the per-provider one.
+fn migrate_links(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if table_columns(conn, "chat_links")?.contains("provider_id") {
+        return Ok(());
+    }
+    // First release: `codewhale_session_id` as a single-column key and a
+    // DeepSeek-named URL column. Rebuild with a (session, provider) key; the
+    // only provider that ever existed was DeepSeek.
+    conn.execute_batch(
+        "CREATE TABLE chat_links_new (
+             codewhale_session_id TEXT NOT NULL,
+             provider_id          TEXT NOT NULL,
+             chat_url             TEXT NOT NULL,
+             created_at           INTEGER NOT NULL,
+             updated_at           INTEGER NOT NULL,
+             PRIMARY KEY (codewhale_session_id, provider_id)
+         );
+         INSERT INTO chat_links_new
+             (codewhale_session_id, provider_id, chat_url, created_at, updated_at)
+         SELECT codewhale_session_id, 'deepseek', deepseek_chat_url, created_at, updated_at
+         FROM chat_links;
+         DROP TABLE chat_links;
+         ALTER TABLE chat_links_new RENAME TO chat_links;",
+    )?;
+    Ok(())
+}
+
+/// Add any column an older database is missing, and rename the first release's
+/// DeepSeek-named URL column to the provider-neutral `chat_url`.
 fn migrate_turns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let existing: std::collections::BTreeSet<String> = {
-        let mut statement = conn.prepare("PRAGMA table_info(chat_turns)")?;
-        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-        names.collect::<Result<_, _>>()?
-    };
+    let existing = table_columns(conn, "chat_turns")?;
+    if existing.contains("deepseek_chat_url") && !existing.contains("chat_url") {
+        conn.execute(
+            "ALTER TABLE chat_turns RENAME COLUMN deepseek_chat_url TO chat_url",
+            [],
+        )?;
+    }
+    let existing = table_columns(conn, "chat_turns")?;
     let wanted = [
         ("outcome", "TEXT NOT NULL DEFAULT 'answered'"),
         ("failure_kind", "TEXT"),
@@ -218,6 +251,15 @@ fn migrate_turns(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
     Ok(())
+}
+
+fn table_columns(
+    conn: &Connection,
+    table: &str,
+) -> Result<std::collections::BTreeSet<String>, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    names.collect::<Result<_, _>>()
 }
 
 /// One row of the turn log: which model answered — or did not — in which
@@ -433,7 +475,7 @@ mod tests {
     #[test]
     fn turn_log_round_trips_newest_first() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
         assert!(store.turns(10).expect("empty").is_empty());
 
         store
@@ -459,7 +501,7 @@ mod tests {
     #[test]
     fn a_failed_turn_is_recorded_with_its_diagnosis() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
         // No session at all — the record must still exist.
         store
             .record_turn(&TurnRow {
@@ -547,24 +589,40 @@ mod tests {
     #[test]
     fn link_store_round_trips_and_updates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open");
+        let store = SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open");
 
-        assert_eq!(store.get("session-a").expect("get"), None);
+        assert_eq!(store.get("session-a", "deepseek").expect("get"), None);
         store
-            .upsert("session-a", "https://chat.deepseek.com/a/chat/s/one")
+            .upsert(
+                "session-a",
+                "deepseek",
+                "https://chat.deepseek.com/a/chat/s/one",
+            )
             .expect("upsert");
         assert_eq!(
-            store.get("session-a").expect("get").as_deref(),
+            store.get("session-a", "deepseek").expect("get").as_deref(),
             Some("https://chat.deepseek.com/a/chat/s/one")
         );
 
         store
-            .upsert("session-a", "https://chat.deepseek.com/a/chat/s/two")
+            .upsert(
+                "session-a",
+                "deepseek",
+                "https://chat.deepseek.com/a/chat/s/two",
+            )
             .expect("re-upsert");
         assert_eq!(
-            store.get("session-a").expect("get").as_deref(),
+            store.get("session-a", "deepseek").expect("get").as_deref(),
             Some("https://chat.deepseek.com/a/chat/s/two")
         );
-        assert_eq!(store.count().expect("count"), 1);
+        // A different provider is a different link, not an overwrite.
+        store
+            .upsert("session-a", "gemini", "https://gemini.google.com/app/x")
+            .expect("gemini upsert");
+        assert_eq!(
+            store.get("session-a", "gemini").expect("get").as_deref(),
+            Some("https://gemini.google.com/app/x")
+        );
+        assert_eq!(store.count().expect("count"), 2);
     }
 }

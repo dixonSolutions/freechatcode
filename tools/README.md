@@ -122,7 +122,7 @@ python3 tools/ocr.py --list-backends
 python3 - <<'PY'
 import glob
 from PIL import Image, ImageDraw, ImageFont
-lines = ["DeepChatCode OCR self-test", "Invoice 2024-0042",
+lines = ["FreeChatCode OCR self-test", "Invoice 2024-0042",
          "Total: 137.50 USD", "handshake-verified"]
 cands = glob.glob('/usr/share/fonts/**/*.ttf', recursive=True)
 font = ImageFont.truetype(cands[0], 30) if cands else ImageFont.load_default()

@@ -1,6 +1,6 @@
-# Example user config for DeepChatCode.
+# Example user config for FreeChatCode.
 #
-# Copy to ~/.codewhale/deepchatcode/config.toml (or $CODEWHALE_HOME/deepchatcode/
+# Copy to ~/.codewhale/freechatcode/config.toml (or $CODEWHALE_HOME/freechatcode/
 # config.toml) and edit. Every key is optional: anything you leave out keeps the
 # compiled-in default from assets/config.default.toml.
 #
@@ -15,7 +15,7 @@ binary = "/home/you/.cargo/bin/codewhale"
 # `{project_dir}` placeholder is filled from the working directory and
 # `{payload}` marks where the Codewhale request JSON goes. When unset, the
 # committed assets/system-prompt.md embedded in the binary is used.
-# system_prompt = "/home/you/.config/deepchatcode/system-prompt.md"
+# system_prompt = "/home/you/.config/freechatcode/system-prompt.md"
 
 # Browser settings. All of these are machine-specific.
 [browser]
@@ -31,7 +31,7 @@ binary = "/home/you/.cargo/bin/codewhale"
 # How often to check that the browser is still there while idle, and reopen it
 # on the conversation in progress if it is not. 0 disables the check.
 # liveness_check_secs = 15
-# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# profile_dir = "/home/you/.codewhale/providers/deepseek/browser"
 # cdp_endpoint = "http://127.0.0.1:9222"
 
 # How completions are delivered.
@@ -48,24 +48,29 @@ binary = "/home/you/.cargo/bin/codewhale"
 # timeout_secs = 300
 # body = "{\"messages\":{messages},\"stream\":true}"
 
-# Override the chat address or accepted hosts.
-[chat]
-# url = "https://chat.deepseek.com"
-# allowed_hosts = ["chat.deepseek.com"]
-# routed_url_pattern = "/a/chat/s/"
-
-# Patch a selector when the DeepSeek Chat UI changes — no rebuild needed.
-[selectors]
-# composer = "textarea"
-# assistant = ".ds-markdown"
-# send = "button[type='submit']"
+# Add a second provider (a free chat site). The shipped defaults already
+# define the DeepSeek provider; add Gemini here. Selectors are best-effort —
+# verify them against the live page before relying on them (see `doctor`).
+#
+# [[providers]]
+# id = "gemini"
+# name = "Gemini"
+#
+# [providers.chat]
+# url = "https://gemini.google.com"
+# allowed_hosts = ["gemini.google.com"]
+# routed_url_pattern = "/app/"
+#
+# [providers.selectors]
+# composer = "div.ql-editor, [contenteditable='true']"
+# assistant = "model-response, [data-testid*='model']"
+# send = "button[aria-label*='send' i]"
 # new_chat = "button[aria-label*='new chat' i]"
-# search_toggle = "button[aria-label*='search' i]"
-# thinking_toggle = "button[aria-label*='think' i]"
-# file_upload = "input[type='file']"
-# Element naming the model in use, so `deepchatcode turns` can attribute a
-# reply to a model. Empty (the default) records it as unknown.
 # model_label = "[data-testid*='model' i]"
+#
+# [[providers.models]]
+# id = "gemini-flash"
+# name = "Gemini Flash"
 
 # Tool forwarding. By default Codewhale's full catalog is forwarded to the
 # chat. Set forward_all = false to send only the essentials plus the search

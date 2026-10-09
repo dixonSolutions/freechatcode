@@ -10,35 +10,31 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use axum::serve;
 use clap::{Parser, Subcommand};
-use playwright_rs::protocol::{
-    BrowserContext, BrowserContextOptions, GotoOptions, Page, RecordVideo, Viewport, WaitUntil,
-};
-use playwright_rs::{ConnectOverCdpOptions, Error as PlaywrightError, Playwright};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 use uuid::Uuid;
 
-use deepchatcode::config::{
-    self, ApiTransportConfig, BrowserMode, ChatConfig, Config, RunMode, Selectors, Timeouts,
-    TransportMode,
-};
-use deepchatcode::health;
-use deepchatcode::sessions::{self, SessionLinks, TurnRow};
-use deepchatcode::setup;
-use deepchatcode::{
-    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, MODEL_ID, PRO_MODEL_ID,
-    ServerState, ToolPolicy, TurnRecord, TurnSink, extract_api_text, router, serves_model,
+use freechatcode::config::{self, ChatConfig, Config, Provider, RunMode, TransportMode};
+use freechatcode::harness::{self, HarnessKind};
+use freechatcode::health;
+use freechatcode::sessions::{self, SessionLinks, TurnRow};
+use freechatcode::setup;
+use freechatcode::{
+    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, ModelSpec, RouteGroup,
+    ServerState, ToolPolicy, TurnRecord, TurnSink, router,
 };
 
+mod browser;
 mod tui;
+
+use browser::{BrowserChat, first_line, make_browser, notify};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "deepchatcode",
-    about = "Poor Man's DeepSeek API — run Codewhale through the free DeepSeek Chat web UI"
+    name = "freechatcode",
+    about = "Run coding agents through free chat web UIs — no API key"
 )]
 struct Args {
     #[command(subcommand)]
@@ -55,6 +51,11 @@ struct Args {
     /// Codewhale executable to launch after the browser is ready.
     #[arg(long, env = "CODEWHALE_BINARY")]
     codewhale_bin: Option<String>,
+
+    /// Agent harness to launch: `codewhale` (default) or `opencode`. Guessed
+    /// from the binary's file name when omitted.
+    #[arg(long, value_enum)]
+    harness: Option<HarnessKind>,
 
     /// Browser profile directory.
     #[arg(long)]
@@ -99,6 +100,12 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Check each configured provider: browser, composer, sign-in.
+    Doctor {
+        /// Check only this provider (default: all configured providers).
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Find (and remember) the codewhale binary, then run the bridge.
     Launch {
         /// Optional codewhale executable name or path to track down.
@@ -109,1251 +116,8 @@ enum Commands {
     },
 }
 
-/// Everything needed to (re)open the browser for this run.
-#[derive(Clone)]
-struct BrowserSpec {
-    config: Config,
-    url: String,
-    profile: PathBuf,
-    cdp_endpoint: Option<String>,
-}
-
-/// A live browser: the page the relay drives plus the handles that keep it up.
-struct Session {
-    page: Page,
-    playwright: Playwright,
-    context: BrowserContext,
-    /// A wrapper-owned browser is closed on exit; an attached one is not.
-    managed: bool,
-    /// Flipped by the page's own close/crash handlers, and by its context closing.
-    closed: Arc<AtomicBool>,
-}
-
-impl Session {
-    /// Wrap a live page and start watching for it going away, so a turn can tell
-    /// "the browser is gone" from "the page is slow" without a round trip.
-    async fn new(
-        page: Page,
-        playwright: Playwright,
-        context: BrowserContext,
-        managed: bool,
-    ) -> Result<Self> {
-        let closed = Arc::new(AtomicBool::new(false));
-        // A watcher that will not register is not fatal: the liveness check falls
-        // back to asking the page itself.
-        if let Err(error) = watched_page(&page, Arc::clone(&closed)).await {
-            eprintln!("deepchatcode: could not watch the page for closure: {error}");
-        }
-        if let Err(error) = watched_context(&context, Arc::clone(&closed)).await {
-            eprintln!("deepchatcode: could not watch the browser context for closure: {error}");
-        }
-        Ok(Self {
-            page,
-            playwright,
-            context,
-            managed,
-            closed,
-        })
-    }
-
-    /// Whether this browser is still usable.
-    fn is_alive(&self) -> bool {
-        !self.closed.load(Ordering::SeqCst) && !self.page.is_closed()
-    }
-}
-
-/// Register a handler that flips `closed` when the page closes or crashes.
-async fn watched_page(page: &Page, closed: Arc<AtomicBool>) -> Result<(), playwright_rs::Error> {
-    let flag = Arc::clone(&closed);
-    page.on_close(move || {
-        let flag = Arc::clone(&flag);
-        async move {
-            flag.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    })
-    .await?;
-    let flag = Arc::clone(&closed);
-    page.on_crash(move || {
-        let flag = Arc::clone(&flag);
-        async move {
-            flag.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    })
-    .await?;
-    Ok(())
-}
-
-/// Register a handler that flips `closed` when the browser context closes.
-async fn watched_context(
-    context: &BrowserContext,
-    closed: Arc<AtomicBool>,
-) -> Result<(), playwright_rs::Error> {
-    context
-        .on_close(move || {
-            let flag = Arc::clone(&closed);
-            async move {
-                flag.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .await?;
-    Ok(())
-}
-
-/// Drives the DeepSeek Chat page — and, for the `api` transport, the site's own
-/// completion endpoint from inside that page.
-struct BrowserChat {
-    spec: BrowserSpec,
-    /// The live browser, held across turns unless `[browser] keep_alive` is off.
-    session: Mutex<Option<Session>>,
-    transport: TransportMode,
-    api: ApiTransportConfig,
-    api_timeout: Duration,
-    keep_alive: bool,
-    response_timeout: Duration,
-    /// What the page last said it was using. Recorded per turn.
-    model_label: Mutex<Option<String>>,
-    /// The conversation this run is in, once one exists. Reopening the browser
-    /// returns here rather than starting a fresh chat. Empty means "use the
-    /// configured URL".
-    resume_url: Mutex<String>,
-    /// The HTTP status the `api` transport last saw, if any. A status is proof
-    /// the service answered, which is what separates "their fault" from ours.
-    last_http_status: Mutex<Option<u16>>,
-}
-
-impl BrowserChat {
-    fn selectors(&self) -> &Selectors {
-        &self.spec.config.selectors
-    }
-
-    fn timeouts(&self) -> &Timeouts {
-        &self.spec.config.timeouts
-    }
-
-    /// Open the browser the configured way: a managed profile, or attach to an
-    /// already-running Chromium.
-    async fn open(&self) -> Result<Session> {
-        if resolves_to_attach(
-            self.spec.config.browser.mode,
-            self.spec.cdp_endpoint.as_deref(),
-        ) {
-            self.attach().await
-        } else {
-            self.launch_managed().await
-        }
-    }
-
-    /// Attach to a browser you already have open (your own signed-in session).
-    async fn attach(&self) -> Result<Session> {
-        let endpoint = self
-            .spec
-            .cdp_endpoint
-            .clone()
-            .unwrap_or_else(|| "http://127.0.0.1:9222".to_owned());
-        let playwright = Playwright::launch()
-            .await
-            .context("start Playwright-RS driver")?;
-        let options = ConnectOverCdpOptions::new().timeout(10_000.0);
-        let browser = playwright
-            .chromium()
-            .connect_over_cdp(&endpoint, Some(options))
-            .await
-            .with_context(|| format!("connect to existing Chromium at {endpoint}"))?;
-        let context = browser
-            .contexts()
-            .into_iter()
-            .next()
-            .context("attach to an existing Chromium context")?;
-        let page = match context.pages().into_iter().next() {
-            Some(page) => {
-                if !self.spec.config.chat.accepts_url(&page.url()) {
-                    self.navigate(&page).await?;
-                }
-                page
-            }
-            None => {
-                let page = context
-                    .new_page()
-                    .await
-                    .context("open a tab in the attached browser")?;
-                self.navigate(&page).await?;
-                page
-            }
-        };
-        self.wait_for_composer(&page, self.timeouts().login_wait())
-            .await?;
-        Session::new(page, playwright, context, false).await
-    }
-
-    /// Launch a dedicated persistent profile. In headless mode the composer is
-    /// probed briefly; if it never appears (no sign-in) the window is reopened
-    /// visible so you can sign in, then polled for the full login window.
-    async fn launch_managed(&self) -> Result<Session> {
-        let config = &self.spec.config;
-        // One actionable sentence beats thirty lines of node stack trace when a
-        // previous run left the profile held.
-        if let Some(holder) = profile_holder(&self.spec.profile) {
-            bail!(
-                "another Chromium is already using the browser profile at {} ({holder}). \
-                 Close it, set [browser] mode = \"attach\" to reuse a browser you started with \
-                 --remote-debugging-port, or pick a different [browser] profile_dir.",
-                self.spec.profile.display()
-            );
-        }
-        tokio::fs::create_dir_all(&self.spec.profile)
-            .await
-            .with_context(|| {
-                format!("create browser profile at {}", self.spec.profile.display())
-            })?;
-        set_private_directory(&self.spec.profile).await?;
-        let playwright = Playwright::launch()
-            .await
-            .context("start Playwright-RS driver")?;
-        let profile = self
-            .spec
-            .profile
-            .to_str()
-            .context("browser profile path is not valid UTF-8")?;
-        let mut headless = config.browser.headless;
-        // A fresh machine has the driver but not the browser. Fetch the browser
-        // once, in place, so a first run needs no separate install step; driver
-        // and browser always match because both come from this crate.
-        let mut installed_browser = false;
-        loop {
-            let mut options = BrowserContextOptions::builder().headless(headless);
-            if let Some(dir) = config.browser.record_video_dir.as_deref() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("create video directory {dir}"))?;
-                let mut video = RecordVideo::new(dir);
-                if let Some((width, height)) = config.browser.video_size() {
-                    video = video.size(Viewport { width, height });
-                }
-                options = options.record_video(video);
-            }
-            let options = options.build();
-            let launched = playwright
-                .chromium()
-                .launch_persistent_context_with_options(profile, options)
-                .await;
-            let context = match launched {
-                Ok(context) => context,
-                Err(PlaywrightError::BrowserNotInstalled { .. }) if !installed_browser => {
-                    eprintln!(
-                        "deepchatcode: Playwright's Chromium is not installed yet; fetching it \
-                         now (one time, ~150 MB). Set PLAYWRIGHT_BROWSERS_PATH to put it elsewhere."
-                    );
-                    playwright_rs::install_browsers(Some(&["chromium"]))
-                        .await
-                        .context("install Playwright Chromium")?;
-                    installed_browser = true;
-                    continue;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("existing browser session")
-                        || message.contains("already in use")
-                    {
-                        bail!(
-                            "the browser profile at {} is already in use by another Chromium; \
-                             close it, or set [browser] mode = \"attach\" to reuse it",
-                            self.spec.profile.display()
-                        );
-                    }
-                    return Err(anyhow::anyhow!(
-                        "launch a persistent Chromium profile: {message}"
-                    ));
-                }
-            };
-            let page = if let Some(page) = context.pages().into_iter().next() {
-                page
-            } else {
-                context.new_page().await.context("open DeepSeek Chat tab")?
-            };
-            self.navigate(&page).await?;
-            let probe = if headless {
-                config.timeouts.login_probe()
-            } else {
-                config.timeouts.login_wait()
-            };
-            match self.wait_for_composer(&page, probe).await {
-                Ok(()) => {
-                    if !config.chat.accepts_url(&page.url()) {
-                        bail!(
-                            "the authenticated browser did not return to an allowed DeepSeek Chat page"
-                        );
-                    }
-                    return Session::new(page, playwright, context, true).await;
-                }
-                Err(_) if headless => {
-                    notify(
-                        config.relay.desktop_notifications,
-                        "DeepSeek sign-in required",
-                        "The headless browser has no composer. Reopening a visible window so you can sign in.",
-                    );
-                    let _ = context.close().await;
-                    headless = false;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// Bound every browser action, set the navigation budget, and land on the
-    /// configured chat URL (or the conversation already in progress).
-    async fn navigate(&self, page: &Page) -> Result<()> {
-        let url = self.target_url().await;
-        self.navigate_to(page, &url).await
-    }
-
-    async fn navigate_to(&self, page: &Page, url: &str) -> Result<()> {
-        let timeouts = self.timeouts();
-        page.set_default_timeout(timeouts.action().as_secs_f64() * 1000.0)
-            .await;
-        page.set_default_navigation_timeout(timeouts.navigation().as_secs_f64() * 1000.0)
-            .await;
-        // `domcontentloaded`, not Playwright's default `load`: the page is a
-        // heavy single-page app, and `load` waits for every font, image and
-        // analytics beacon before returning. The wrapper does not want "the page
-        // has finished fetching everything", it wants "the composer is there" —
-        // which it polls for itself, a moment later, and which is the only
-        // readiness that answers a prompt. This is worth seconds on a cold start.
-        page.goto(
-            url,
-            Some({
-                let mut options = GotoOptions::new();
-                options.wait_until = Some(WaitUntil::DomContentLoaded);
-                options
-            }),
-        )
-        .await
-        .with_context(|| format!("open DeepSeek Chat page {url}"))?;
-        Ok(())
-    }
-
-    /// Whether the visible page is a real, populated conversation on an allowed
-    /// host — i.e. safe to continue in rather than realign from scratch.
-    async fn conversation_present(&self, page: &Page) -> bool {
-        let chat = &self.spec.config.chat;
-        let deadline = Instant::now() + self.timeouts().link_probe();
-        let poll = self.timeouts().poll();
-        loop {
-            let composer = page.locator(&self.selectors().composer).first();
-            let ready = composer.count().await.unwrap_or(0) > 0
-                && composer.is_visible().await.unwrap_or(false);
-            if ready && chat.is_resumable_url(&page.url()) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(poll).await;
-        }
-    }
-
-    async fn wait_for_composer(&self, page: &Page, timeout: Duration) -> Result<()> {
-        eprintln!(
-            "Sign in directly in the browser window if needed; the wrapper never reads credentials."
-        );
-        let deadline = Instant::now() + timeout;
-        let poll = self.timeouts().poll();
-        loop {
-            let locator = page.locator(&self.selectors().composer);
-            let count = locator.count().await.unwrap_or(0);
-            let visible = locator.first().is_visible().await.unwrap_or(false);
-            if count > 0 && visible {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "the DeepSeek Chat composer did not appear before the {}s wait expired",
-                    timeout.as_secs()
-                );
-            }
-            tokio::time::sleep(poll).await;
-        }
-    }
-
-    /// Read the model the page says it is using, when the UI exposes it.
-    ///
-    /// DeepSeek's chat page renders its modes as `div.ds-toggle-button` chips
-    /// ("DeepThink", "Search") whose `--selected` class says which is on, so a
-    /// turn can record e.g. `DeepThink=on, Search=on`.
-    async fn read_model_label(&self, page: &Page) -> Option<String> {
-        let selector = self.selectors().model_label.trim();
-        if selector.is_empty() {
-            return None;
-        }
-        let locator = page.locator(selector);
-        let count = locator.count().await.ok()?;
-        let mut parts = Vec::new();
-        for index in 0..count.min(6) {
-            let item = locator.nth(index as i32);
-            let text = item.inner_text().await.unwrap_or_default();
-            let text = text.trim();
-            if text.is_empty() {
-                continue;
-            }
-            let selected = item
-                .get_attribute("class")
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|class| class.contains("selected"));
-            parts.push(format!("{text}{}", if selected { "=on" } else { "=off" }));
-        }
-        (!parts.is_empty()).then(|| parts.join(", "))
-    }
-
-    /// Where to (re)open the browser: the conversation this run is already in,
-    /// else the configured chat URL.
-    async fn target_url(&self) -> String {
-        let current = self.resume_url.lock().await;
-        if current.is_empty() {
-            self.spec.url.clone()
-        } else {
-            current.clone()
-        }
-    }
-
-    /// Record the conversation the page is on, so a relaunch returns to it
-    /// instead of starting a new chat.
-    async fn remember_conversation(&self, page: &Page) {
-        let url = page.url();
-        if self.spec.config.chat.is_resumable_url(&url) {
-            *self.resume_url.lock().await = url;
-        }
-    }
-
-    /// Guarantee a live, usable page, reopening the browser when it has gone
-    /// away. This is the persistence guarantee: a browser that is closed or
-    /// crashes costs a relaunch, not the session.
-    async fn ensure_live(&self, guard: &mut Option<Session>) -> Result<(), String> {
-        if let Some(session) = guard.as_ref()
-            && !session.is_alive()
-        {
-            eprintln!(
-                "deepchatcode: the browser is gone; reopening it on the conversation and carrying on"
-            );
-            if let Some(gone) = guard.take() {
-                close_session(gone).await;
-            }
-        }
-        if guard.is_none() {
-            *guard = Some(self.open().await.map_err(|error| format!("{error:#}"))?);
-        }
-        Ok(())
-    }
-
-    /// Whether a failed turn is worth one relaunch. A browser that has gone away
-    /// — or a page whose composer vanished under it — is recoverable; a refusal
-    /// from the model is not. See [`turn_is_recoverable`].
-    fn recoverable(&self, session: Option<&Session>, error: &str) -> bool {
-        turn_is_recoverable(session, error)
-    }
-
-    /// Classify a failed turn: what happened, and whose fault it is.
-    ///
-    /// Order matters. A browser that is already gone is our problem, not the
-    /// network's. An HTTP status means the service answered and chose to fail, so
-    /// that is theirs. A Chromium `net::` code means the request never got that
-    /// far, so the uplink takes the blame. Only when none of those apply is the
-    /// machine probed — guessing "DeepSeek is broken" while the DNS is down is
-    /// exactly the mistake worth avoiding.
-    async fn classify(&self, error: &str) -> Failure {
-        let session_dead = self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|session| !session.is_alive());
-        if session_dead {
-            return Failure {
-                kind: "browser_gone".to_owned(),
-                blame: "wrapper".to_owned(),
-                detail: first_line(error),
-                http_status: None,
-            };
-        }
-
-        if let Some(status) = *self.last_http_status.lock().await {
-            return Failure {
-                kind: "upstream_http".to_owned(),
-                blame: "service".to_owned(),
-                detail: format!("the endpoint answered HTTP {status}: {}", first_line(error)),
-                http_status: Some(status),
-            };
-        }
-
-        if let Some(kind) = network_error_kind(error) {
-            return Failure {
-                kind: kind.to_owned(),
-                blame: "network".to_owned(),
-                detail: first_line(error),
-                http_status: None,
-            };
-        }
-
-        // The browser offered no verdict, so ask the machine directly.
-        match self.probe_reachability().await {
-            Reachability::Unresolvable => Failure {
-                kind: "dns".to_owned(),
-                blame: "network".to_owned(),
-                detail: format!(
-                    "{} (and this host cannot resolve the chat host)",
-                    first_line(error)
-                ),
-                http_status: None,
-            },
-            Reachability::Unreachable => Failure {
-                kind: "network".to_owned(),
-                blame: "network".to_owned(),
-                detail: format!(
-                    "the chat host resolves but nothing accepts a connection: {}",
-                    first_line(error)
-                ),
-                http_status: None,
-            },
-            Reachability::Reachable => {
-                // DNS and the uplink are demonstrably fine, so this is the page.
-                // Without an HTTP status we do not claim it is the service's
-                // fault — only that it is not the network's.
-                let (kind, note) = if error.contains("no visible assistant reply") {
-                    (
-                        "page_silent",
-                        "the chat host is reachable, so DNS and the uplink are fine",
-                    )
-                } else if error.contains("composer") {
-                    ("page_changed", "the composer is no longer where it was")
-                } else {
-                    (
-                        "page_error",
-                        "the host is reachable; the page did not answer",
-                    )
-                };
-                Failure {
-                    kind: kind.to_owned(),
-                    blame: "unknown".to_owned(),
-                    detail: format!("{note}: {}", first_line(error)),
-                    http_status: None,
-                }
-            }
-        }
-    }
-
-    /// Whether the chat host resolves and accepts a connection, without the
-    /// browser. Run off the async runtime, since DNS and connect block.
-    async fn probe_reachability(&self) -> Reachability {
-        let host = url::Url::parse(&self.spec.config.chat.url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        let Some(host) = host else {
-            return Reachability::Unreachable;
-        };
-        tokio::task::spawn_blocking(move || {
-            use std::net::{TcpStream, ToSocketAddrs};
-            let Ok(addrs) = (host.as_str(), 443u16).to_socket_addrs() else {
-                return Reachability::Unresolvable;
-            };
-            let addrs: Vec<_> = addrs.collect();
-            if addrs.is_empty() {
-                return Reachability::Unresolvable;
-            }
-            for addr in addrs {
-                if TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok() {
-                    return Reachability::Reachable;
-                }
-            }
-            Reachability::Unreachable
-        })
-        .await
-        .unwrap_or(Reachability::Unreachable)
-    }
-
-    /// Run one turn: open the browser if needed, drive it, recover once from a
-    /// browser that died, record the model label and conversation, and (when
-    /// `keep_alive` is off) close it again.
-    async fn turn(
-        &self,
-        prompt: &str,
-        start_new_chat: bool,
-        snapshots: Option<tokio::sync::mpsc::Sender<String>>,
-    ) -> Result<String, String> {
-        let mut guard = self.session.lock().await;
-        *self.last_http_status.lock().await = None;
-        self.ensure_live(&mut guard).await?;
-        // One recovery is generosity; a loop would hide a browser that dies
-        // every turn.
-        let mut recovered = false;
-        // The direct API path is refused exactly as STATUS.md describes: the
-        // site's completion endpoint wants a per-request proof-of-work header
-        // this project does not synthesize. That is a property of the endpoint,
-        // not a reason for `silent` to be useless — the page is already open and
-        // already invisible, so drive it and say so. One line, once per turn.
-        let mut api_refused = false;
-        let outcome = loop {
-            let attempt = {
-                let session = guard.as_ref().expect("a session was just opened");
-                match self.transport {
-                    TransportMode::Gui => {
-                        self.submit(&session.page, prompt, start_new_chat, snapshots.clone())
-                            .await
-                    }
-                    TransportMode::Api => match self.call_api(&session.page, prompt).await {
-                        Ok(text) => Ok(text),
-                        Err(error) => {
-                            if !api_refused {
-                                api_refused = true;
-                                eprintln!(
-                                    "deepchatcode: the direct API path refused ({error}); \
-                                     using the headless page for this turn instead"
-                                );
-                            }
-                            self.submit(&session.page, prompt, start_new_chat, snapshots.clone())
-                                .await
-                        }
-                    },
-                }
-            };
-            match attempt {
-                Ok(text) => break Ok(text),
-                Err(error) => {
-                    if recovered || !self.recoverable(guard.as_ref(), &error) {
-                        break Err(error);
-                    }
-                    eprintln!(
-                        "deepchatcode: the browser did not survive the turn ({error}); \
-                         reopening it and retrying once"
-                    );
-                    if let Some(gone) = guard.take() {
-                        close_session(gone).await;
-                    }
-                    self.ensure_live(&mut guard).await?;
-                    recovered = true;
-                }
-            }
-        };
-        if let Some(session) = guard.as_ref() {
-            *self.model_label.lock().await = self.read_model_label(&session.page).await;
-            if outcome.is_ok() {
-                self.remember_conversation(&session.page).await;
-            }
-        }
-        if !self.keep_alive
-            && let Some(session) = guard.take()
-        {
-            close_session(session).await;
-        }
-        outcome
-    }
-
-    /// The `api` transport: POST the configured body from inside the chat page
-    /// so the signed-in session's cookies apply, then extract the text. This
-    /// endpoint is private and every part of its shape is configuration.
-    async fn call_api(&self, page: &Page, prompt: &str) -> Result<String, String> {
-        let messages = serde_json::json!([{"role": "user", "content": prompt}]);
-        // Which model answers is page state, and the relay has already set it
-        // before this call. Read it back rather than assuming: a template that
-        // never names `{thinking}` cannot be told about it, and an endpoint that
-        // answers the plain model while the caller asked for pro is exactly the
-        // lie this wrapper refuses to tell. Failing here is not a dead end — the
-        // turn is retried through the headless page, which can honour it.
-        let thinking = matches!(
-            chip_is_selected(page, self.selectors().thinking_toggle.trim()).await,
-            Some(true)
-        );
-        if thinking && !self.api.body.contains("{thinking}") {
-            return Err(
-                "the page is in pro mode but [transport.api] body has no {thinking} \
-                 placeholder, so the endpoint cannot be told which model to use; add \
-                 {thinking} to the body template, or run with [transport] mode = \"gui\""
-                    .to_owned(),
-            );
-        }
-        let body = self.api.render_body(&messages, None, prompt, thinking);
-        let url = self.api.url.clone();
-        let headers = self.api.extra_headers.clone();
-        let script = "async ([url, body, extra]) => { const headers = Object.assign({'content-type': 'application/json'}, extra); const r = await fetch(url, {method: 'POST', headers, body, credentials: 'include'}); return r.status + '\\n' + (await r.text()); }";
-        let arg = serde_json::json!([url, body, headers]);
-        let raw: String = tokio::time::timeout(self.api_timeout, page.evaluate(script, Some(&arg)))
-            .await
-            .map_err(|_| {
-                format!(
-                    "the api transport timed out after {}s",
-                    self.api_timeout.as_secs()
-                )
-            })?
-            .map_err(|error| format!("the api transport call failed: {error}"))?;
-        // The first line is the HTTP status; the rest is the body.
-        let (status, payload) = raw.split_once('\n').unwrap_or(("", raw.as_str()));
-        let status_code = status.trim().parse::<u16>().ok();
-        // Remembered for `classify`: a status is proof the service answered.
-        *self.last_http_status.lock().await = status_code;
-        let text = extract_api_text(self.api.framing, &self.api.text_path, payload);
-        if text.trim().is_empty() {
-            // Show what came back: an endpoint that answers 200 with an error
-            // envelope is otherwise indistinguishable from an empty success.
-            let head: String = payload.chars().take(240).collect();
-            return Err(format!(
-                "the api transport returned no text (HTTP {status}, {} bytes): {head}",
-                payload.len()
-            ));
-        }
-        Ok(text)
-    }
-
-    async fn submit(
-        &self,
-        page: &Page,
-        prompt: &str,
-        start_new_chat: bool,
-        snapshots: Option<tokio::sync::mpsc::Sender<String>>,
-    ) -> Result<String, String> {
-        if start_new_chat {
-            self.start_new_chat(page).await?;
-        }
-        let composer = page.locator(&self.selectors().composer).first();
-        if !composer.is_visible().await.unwrap_or(false) {
-            return Err("DeepSeek Chat composer is no longer visible".into());
-        }
-        // Remember the newest reply as it stands *before* the send. Reading the
-        // last element rather than the whole transcript is what keeps this
-        // cheap: pulling every assistant message on every poll is what made the
-        // first turn feel stalled.
-        let assistants = page.locator(&self.selectors().assistant);
-        let previous_count = assistants
-            .count()
-            .await
-            .map_err(|_| "could not inspect the visible assistant transcript".to_owned())?;
-        let previous_text = if previous_count > 0 {
-            assistants
-                .last()
-                .inner_text()
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_owned()
-        } else {
-            String::new()
-        };
-        let action = self.timeouts().action();
-        tokio::time::timeout(action, composer.fill(prompt, None))
-            .await
-            .map_err(|_| format!("entering the {} byte request timed out", prompt.len()))?
-            .map_err(|error| {
-                format!("could not enter the request in the visible chat composer: {error}")
-            })?;
-        let send = page.locator(&self.selectors().send);
-        if send.count().await.unwrap_or(0) > 0 && send.last().is_visible().await.unwrap_or(false) {
-            tokio::time::timeout(action, send.last().click(None))
-                .await
-                .map_err(|_| "submitting the visible request timed out".to_owned())?
-                .map_err(|error| {
-                    format!("could not submit the request in the visible chat UI: {error}")
-                })?;
-        } else {
-            tokio::time::timeout(action, composer.press("Enter", None))
-                .await
-                .map_err(|_| "submitting the request timed out".to_owned())?
-                .map_err(|error| {
-                    format!("could not submit the request in the visible chat composer: {error}")
-                })?;
-        }
-
-        // Confirm the platform actually took the send. A `fill()` the page's
-        // framework never observes leaves the Send control inert: Playwright's
-        // click "succeeds", nothing is posted, and we would otherwise poll for a
-        // reply that can never arrive.
-        let trimmed = prompt.trim_end();
-        let mut boundary = trimmed.len().saturating_sub(24);
-        while boundary < trimmed.len() && !trimmed.is_char_boundary(boundary) {
-            boundary += 1;
-        }
-        let marker = &trimmed[boundary..];
-        let settle_by = Instant::now() + Duration::from_secs(15);
-        let mut retried = false;
-        loop {
-            let value = composer.input_value(None).await.unwrap_or_default();
-            let still_held = if value.is_empty() {
-                composer
-                    .inner_text()
-                    .await
-                    .map(|text| text.contains(marker))
-                    .unwrap_or(false)
-            } else {
-                value.contains(marker)
-            };
-            if !still_held {
-                break;
-            }
-            if !retried {
-                // The click may have hit a control that does nothing; retry
-                // through the keyboard path once before giving up.
-                retried = true;
-                let _ = tokio::time::timeout(action, composer.press("Enter", None)).await;
-                continue;
-            }
-            if Instant::now() >= settle_by {
-                return Err(
-                    "the platform did not accept the send; the request is still sitting in the composer"
-                        .to_owned(),
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        let deadline = Instant::now() + self.response_timeout;
-        let poll = self.timeouts().poll();
-        let settle_polls = self.timeouts().settle_polls.max(1);
-        let mut prior_text = String::new();
-        let mut stable_polls = 0_u32;
-        // Waiting silently for minutes is indistinguishable from a hang. Say what
-        // is happening, on the wrapper's own stderr, while the page thinks.
-        let started = Instant::now();
-        let mut last_note = Instant::now();
-        loop {
-            let count = assistants
-                .count()
-                .await
-                .map_err(|_| "could not read the visible assistant reply".to_owned())?;
-            // The transcript is virtualized: once the mounted window is full the
-            // element count stops growing while replies keep arriving, so a
-            // growth test alone reports a page that answered as silent. The
-            // newest message stays mounted, so its text is the signal that
-            // survives. One element per poll is cheap; the whole transcript is
-            // what made the first turn feel stalled.
-            let text = if count > 0 {
-                assistants.last().inner_text().await.unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let text = text.trim();
-            if reply_arrived(previous_count, &previous_text, count, text) {
-                if text == prior_text {
-                    stable_polls = stable_polls.saturating_add(1);
-                } else {
-                    stable_polls = 0;
-                    prior_text.clear();
-                    prior_text.push_str(text);
-                    if let Some(snapshots) = &snapshots {
-                        // The whole visible reply, not a delta: the relay
-                        // turns it into content deltas, and a dropped
-                        // message cannot corrupt the stream.
-                        let _ = snapshots.send(text.to_owned()).await;
-                    }
-                }
-                if stable_polls >= settle_polls {
-                    // Is the page actually idle, or merely between renders? Report
-                    // what the page itself says, because that — not a timer — is
-                    // what would end the turn without either risking a truncated
-                    // reply or paying a fixed wait on every turn.
-                    let send_controls = page
-                        .locator(&self.selectors().send)
-                        .count()
-                        .await
-                        .unwrap_or(0);
-                    eprintln!(
-                        "deepchatcode: reply settled after {} polls ({} chars, {}s); \
-                         page send control(s): {send_controls}",
-                        stable_polls,
-                        prior_text.len(),
-                        started.elapsed().as_secs(),
-                    );
-                    return Ok(text.to_owned());
-                }
-            }
-            if last_note.elapsed() >= Duration::from_secs(15) {
-                last_note = Instant::now();
-                eprintln!(
-                    "deepchatcode: waiting for the page… {}s of {}s | {} assistant element(s) ({} before this turn) | composer {} char(s) | newest reply {} char(s)",
-                    started.elapsed().as_secs(),
-                    self.response_timeout.as_secs(),
-                    count,
-                    previous_count,
-                    composer.input_value(None).await.unwrap_or_default().len(),
-                    prior_text.len(),
-                );
-            }
-            if Instant::now() >= deadline {
-                // Say what the page actually looked like: without this the only
-                // symptom is "it hung", which is unfixable.
-                let url = page.url();
-                let elements = assistants.count().await.unwrap_or(0);
-                let composer_len = composer.input_value(None).await.unwrap_or_default().len();
-                let newest = if elements > 0 {
-                    assistants.last().inner_text().await.unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                eprintln!(
-                    "deepchatcode: no reply after {}s. Open {url} to see what the page is \
-                     showing; the conversation is linked to this Codewhale session.",
-                    self.response_timeout.as_secs()
-                );
-                return Err(format!(
-                    "no visible assistant reply within {}s (url={url}, assistant_elements={elements}, before={previous_count}, composer_chars={composer_len}, newest_chars={}, streamed_chars={}). The prompt was accepted{}. No new reply became visible in that window, and that is all this says — a reply can still land after this budget, so open the URL and look before blaming the page. If the page is merely slow, raise [timeouts] response_secs (the {} byte prompt is not the usual reason: a long conversation is read from its newest message, not from a reply count).",
-                    self.response_timeout.as_secs(),
-                    newest.trim().len(),
-                    prior_text.len(),
-                    if composer_len == 0 {
-                        " (the composer is empty)"
-                    } else {
-                        " (the composer still holds text)"
-                    },
-                    prompt.len(),
-                ));
-            }
-            tokio::time::sleep(poll).await;
-        }
-    }
-
-    /// Start a fresh conversation.
-    ///
-    /// Navigating back to the bare chat URL is the fast, reliable path — the
-    /// platform treats it as a new conversation — so the "New chat" control is
-    /// only hunted down when navigation leaves us inside a conversation. Hunting
-    /// for the control first cost ~5s on every fresh turn.
-    async fn start_new_chat(&self, page: &Page) -> Result<(), String> {
-        let chat = &self.spec.config.chat;
-        if !chat.is_resumable_url(&page.url()) {
-            // Already on the bare chat URL: this is a new conversation already.
-            return Ok(());
-        }
-        let base = chat.url.clone();
-        match self.navigate_to(page, &base).await {
-            Ok(()) => {
-                if !chat.is_resumable_url(&page.url()) {
-                    return Ok(());
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "deepchatcode: could not return to the bare chat URL ({error:#}); falling back to the New chat control"
-                );
-            }
-        }
-        let mut button = page.locator(&self.selectors().new_chat);
-        if button.count().await.unwrap_or(0) == 0 {
-            button = page.get_by_text("New chat", false);
-        }
-        if button.count().await.unwrap_or(0) == 0 {
-            button = page.get_by_text("新对话", false);
-        }
-        if button.count().await.unwrap_or(0) == 0 {
-            eprintln!(
-                "deepchatcode: no New Chat control found; sending into the current conversation"
-            );
-            return Ok(());
-        }
-        match tokio::time::timeout(Duration::from_secs(3), button.first().click(None)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                eprintln!("deepchatcode: could not start a new chat ({error}); continuing");
-                Ok(())
-            }
-            Err(_) => {
-                eprintln!("deepchatcode: starting a new chat timed out; continuing");
-                Ok(())
-            }
-        }
-    }
-
-    /// Open the browser now, so a stale session link is caught before Codewhale
-    /// starts rather than on the first turn.
-    async fn ensure_open(&self) -> Result<(), String> {
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.open().await.map_err(|error| format!("{error:#}"))?);
-        }
-        Ok(())
-    }
-
-    /// Keep the browser alive between turns.
-    ///
-    /// A browser that is closed or crashes while the bridge sits idle used to
-    /// stay gone until the next prompt. This notices within one interval and
-    /// reopens it — on the conversation already in progress — so "it was closed"
-    /// heals by itself. Failures back off, so a machine with no network does not
-    /// spin, and the caller only starts this when `keep_alive` is on (with it
-    /// off, an absent browser is the point).
-    async fn watch_browser(self: Arc<Self>, interval: Duration) {
-        let mut wait = interval;
-        loop {
-            tokio::time::sleep(wait).await;
-            let mut guard = self.session.lock().await;
-            // Nothing has been opened yet, or it is fine: nothing to do.
-            let healthy = match guard.as_ref() {
-                None => true,
-                Some(session) => session.is_alive(),
-            };
-            if healthy {
-                wait = interval;
-                continue;
-            }
-
-            eprintln!(
-                "deepchatcode: the browser is gone; reopening it on the conversation and carrying on"
-            );
-            if let Some(gone) = guard.take() {
-                close_session(gone).await;
-            }
-            match self.open().await {
-                Ok(session) => {
-                    *guard = Some(session);
-                    eprintln!("deepchatcode: the browser is back");
-                    wait = interval;
-                }
-                Err(error) => {
-                    let message = first_line(&format!("{error:#}"));
-                    eprintln!("deepchatcode: could not reopen the browser yet: {message}");
-                    wait = (wait * 2).min(MAX_LIVENESS_BACKOFF);
-                }
-            }
-        }
-    }
-
-    /// Whether the linked conversation is actually reachable right now.
-    async fn link_available(&self) -> bool {
-        let guard = self.session.lock().await;
-        let Some(session) = guard.as_ref() else {
-            return false;
-        };
-        self.conversation_present(&session.page).await
-    }
-
-    /// The live page's URL, when a browser is open.
-    async fn live_url(&self) -> Option<String> {
-        let guard = self.session.lock().await;
-        guard.as_ref().map(|session| session.page.url())
-    }
-
-    /// Close the browser for good at the end of the run.
-    async fn shutdown(&self) {
-        let mut guard = self.session.lock().await;
-        if let Some(session) = guard.take() {
-            close_session(session).await;
-        }
-    }
-}
-
-/// Whether `open` attaches instead of launching. An explicit CDP endpoint always
-/// means attach, whatever `mode` says — that is what `--cdp-endpoint` promises.
-fn resolves_to_attach(mode: BrowserMode, cdp_endpoint: Option<&str>) -> bool {
-    cdp_endpoint.is_some_and(|endpoint| !endpoint.trim().is_empty()) || mode == BrowserMode::Attach
-}
-
-/// A profile another Chromium already holds cannot be launched. Detect it up
-/// front so the failure is one actionable sentence instead of a node stack.
-/// Chromium records the holder in `SingletonLock` as a `"<host>-<pid>"` symlink.
-fn profile_holder(profile: &Path) -> Option<String> {
-    let target = std::fs::read_link(profile.join("SingletonLock")).ok()?;
-    let target = target.to_string_lossy().into_owned();
-    let pid: i32 = target.rsplit('-').next()?.parse().ok()?;
-    Path::new(&format!("/proc/{pid}"))
-        .exists()
-        .then_some(target)
-}
-
-/// Ceiling for the liveness watcher's retry backoff.
-const MAX_LIVENESS_BACKOFF: Duration = Duration::from_secs(300);
-
-/// Whether the chat host can be reached at all, independent of the browser.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reachability {
-    /// The name did not resolve: DNS, so not the service's fault.
-    Unresolvable,
-    /// The name resolved but nothing would accept a connection.
-    Unreachable,
-    /// Something is listening.
-    Reachable,
-}
-
-/// Whether the transcript changed in a way that means a **new** reply arrived.
-///
-/// `previous_*` is the newest visible assistant message before the send, `count`
-/// and `text` after a poll. Growth is proof of a new message. A *replaced*
-/// newest message is proof too, and it is the only signal that survives a
-/// virtualized transcript — the case that made long conversations look silent:
-/// once the mounted window is full, the page unmounts an old message in the
-/// same render that mounts the new one, the count stops growing, and a growth
-/// test alone waits out the whole budget on a page that already answered.
-fn reply_arrived(previous_count: usize, previous_text: &str, count: usize, text: &str) -> bool {
-    // Trim here rather than trusting the caller: a mounted-but-empty element
-    // during generation holds whitespace, and "nothing written yet" must not
-    // read as an answer.
-    let text = text.trim();
-    let previous_text = previous_text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    // A count that *shrank* is not evidence of a new reply — the window shifted.
-    // A text that changed is: the newest message is always the mounted last one.
-    count > previous_count || text != previous_text
-}
-
-/// Classify a browser-level network error from its Chromium code.
-fn network_error_kind(error: &str) -> Option<&'static str> {
-    const DNS: [&str; 4] = [
-        "ERR_NAME_NOT_RESOLVED",
-        "ERR_NAME_RESOLUTION_FAILED",
-        "ERR_DNS_",
-        "ERR_ICANN_NAME_COLLISION",
-    ];
-    const NETWORK: [&str; 9] = [
-        "ERR_INTERNET_DISCONNECTED",
-        "ERR_CONNECTION_REFUSED",
-        "ERR_CONNECTION_TIMED_OUT",
-        "ERR_CONNECTION_RESET",
-        "ERR_CONNECTION_CLOSED",
-        "ERR_ADDRESS_UNREACHABLE",
-        "ERR_NETWORK_CHANGED",
-        "ERR_PROXY_CONNECTION_FAILED",
-        "ERR_TUNNEL_CONNECTION_FAILED",
-    ];
-    if DNS.iter().any(|sign| error.contains(sign)) {
-        Some("dns")
-    } else if NETWORK.iter().any(|sign| error.contains(sign)) {
-        Some("network")
-    } else {
-        None
-    }
-}
-
-/// Whether the mode chip matching `selector` is selected, per the page's own
-/// `--selected` class. `None` means it could not be read, which is not the same
-/// as "off" — and the difference matters before and after a click.
-async fn chip_is_selected(page: &Page, selector: &str) -> Option<bool> {
-    let control = page.locator(selector).first();
-    if control.count().await.ok()? == 0 {
-        return None;
-    }
-    control
-        .get_attribute("class")
-        .await
-        .ok()
-        .flatten()
-        .map(|class| class.contains("selected"))
-}
-
-/// Playwright errors arrive with a node stack trace attached. Keep the one line
-/// that says what happened; the full text still goes to the audit log.
-fn first_line(error: &str) -> String {
-    error.lines().next().unwrap_or(error).trim().to_owned()
-}
-
-/// Whether a failed turn is worth one relaunch. A browser that has gone away —
-/// or a page whose composer vanished under it — is recoverable; a refusal from
-/// the model is not.
-fn turn_is_recoverable(session: Option<&Session>, error: &str) -> bool {
-    if session.is_some_and(|session| !session.is_alive()) {
-        return true;
-    }
-    const SIGNS: [&str; 6] = [
-        "Target closed",
-        "target closed",
-        "has been closed",
-        "Browser has been closed",
-        "Connection closed",
-        "composer is no longer visible",
-    ];
-    SIGNS.iter().any(|sign| error.contains(sign))
-}
-
-/// Close a session: a wrapper-owned context is closed; an attached browser only
-/// loses its driver connection. A context that has already died is not an error
-/// — that is the case this whole path exists for.
-async fn close_session(session: Session) {
-    if session.managed
-        && session.is_alive()
-        && let Err(error) = session.context.close().await
-    {
-        eprintln!("deepchatcode: closing the browser context failed: {error}");
-    }
-    if let Err(error) = session.playwright.shutdown().await {
-        eprintln!("deepchatcode: stopping the Playwright driver failed: {error}");
-    }
-}
-
-#[async_trait::async_trait]
-impl ChatUi for BrowserChat {
-    async fn send(&self, prompt: &str, start_new_chat: bool) -> Result<String, String> {
-        self.turn(prompt, start_new_chat, None).await
-    }
-
-    async fn send_streaming(
-        &self,
-        prompt: &str,
-        start_new_chat: bool,
-        snapshots: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<String, String> {
-        self.turn(prompt, start_new_chat, Some(snapshots)).await
-    }
-
-    async fn model_label(&self) -> Option<String> {
-        self.model_label.lock().await.clone()
-    }
-
-    /// Make the page's reasoning state match the model this turn asked for.
-    ///
-    /// Declarative, not a toggle: the wrapper advertises two models and which one
-    /// answers is page state, so a pro turn must not leak into the chat turn
-    /// after it and a chat turn must not inherit a pro one. A pro turn that
-    /// cannot engage the control fails — answering with the plain model while the
-    /// turn log says pro would be a lie.
-    async fn set_reasoning(&self, pro: bool) -> Result<(), String> {
-        let selector = self.selectors().thinking_toggle.trim().to_owned();
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or("the browser is not open")?;
-        let page = &session.page;
-        if selector.is_empty() {
-            return if pro {
-                Err(
-                    "[selectors] thinking_toggle is empty, so the pro model cannot be engaged"
-                        .to_owned(),
-                )
-            } else {
-                Ok(())
-            };
-        }
-        let control = page.locator(&selector).first();
-        if !control.is_visible().await.unwrap_or(false) {
-            return if pro {
-                Err(format!(
-                    "no visible DeepThink control on the page ({selector}); check \
-                     [selectors] thinking_toggle"
-                ))
-            } else {
-                // Nothing to settle: a page without the control answers with the
-                // plain model anyway.
-                Ok(())
-            };
-        }
-        let engaged = chip_is_selected(page, &selector).await;
-        if engaged == Some(pro) {
-            return Ok(());
-        }
-        tokio::time::timeout(self.timeouts().action(), control.click(None))
-            .await
-            .map_err(|_| "clicking the DeepThink control timed out".to_owned())?
-            .map_err(|error| format!("could not click the DeepThink control: {error}"))?;
-        // A click is a request, not a fact. Read it back before believing it.
-        let after = chip_is_selected(page, &selector).await;
-        if after != Some(pro) {
-            return Err(format!(
-                "the DeepThink control did not {}{}",
-                if pro { "engage" } else { "disengage" },
-                match after {
-                    Some(_) => " (it read back unchanged)",
-                    None => " (its state could not be read back)",
-                }
-            ));
-        }
-        Ok(())
-    }
-}
-
+/// One JSONL file per relay run: inputs, outputs, errors, with the path the
+/// wrapper already names on startup.
 struct JsonlAudit {
     path: PathBuf,
     lock: Mutex<()>,
@@ -1447,6 +211,7 @@ struct UrlLinkingChat {
     sessions_dir: PathBuf,
     workspace: PathBuf,
     chat: ChatConfig,
+    provider_id: String,
     linked: AtomicBool,
     /// Set by the startup warm-up when the linked conversation turned out not to
     /// exist. Checked once, on the first turn: the browser is warmed in parallel
@@ -1484,14 +249,14 @@ impl UrlLinkingChat {
         let Some(session) = session else {
             return false;
         };
-        match self.links.upsert(&session, &url) {
+        match self.links.upsert(&session, &self.provider_id, &url) {
             Ok(()) => {
                 eprintln!("Linked Codewhale session {session} to {url}");
                 self.linked.store(true, Ordering::SeqCst);
                 true
             }
             Err(error) => {
-                eprintln!("deepchatcode: could not record the session link: {error}");
+                eprintln!("freechatcode: could not record the session link: {error}");
                 false
             }
         }
@@ -1542,9 +307,9 @@ struct TurnLog {
 #[async_trait::async_trait]
 impl TurnSink for TurnLog {
     async fn record(&self, turn: TurnRecord) -> Result<(), String> {
-        let chat_url = match self.session.as_deref() {
-            Some(session) => self.links.get(session).ok().flatten(),
-            None => None,
+        let chat_url = match (self.session.as_deref(), turn.provider_id.as_deref()) {
+            (Some(session), Some(provider)) => self.links.get(session, provider).ok().flatten(),
+            _ => None,
         };
         // A turn with no failure answered; a turn with one is recorded as failed
         // alongside the diagnosis, so the history says *whose* fault it was.
@@ -1597,7 +362,7 @@ fn iso_utc(seconds: i64) -> String {
 
 /// Print the recorded turn log.
 fn print_turns(home: &Path, limit: usize) -> Result<()> {
-    let links = SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+    let links = SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
         .map_err(|error| anyhow::anyhow!(error))?;
     let rows = links.turns(limit).map_err(|error| anyhow::anyhow!(error))?;
     if rows.is_empty() {
@@ -1666,7 +431,7 @@ async fn run_lobby(binary: Option<&str>) -> Result<()> {
 /// discipline into raw mode — the terminal comes back with `ECHO` on, and the
 /// TUI's own mouse reports are then echoed back through the line discipline as
 /// `^[[<0;10;5M` text scattered over the screen. Measured, not guessed: an
-/// `LD_PRELOAD` interposer shows `comm=deepchatcode tcsetattr fd=0(/dev/pts/N)`
+/// `LD_PRELOAD` interposer shows `comm=freechatcode tcsetattr fd=0(/dev/pts/N)`
 /// with the cooked flags at the moment the browser appears, and the bare
 /// Codewhale TUI never does this to itself.
 ///
@@ -1703,13 +468,185 @@ fn take_terminal_off_stdin() -> Option<std::fs::File> {
     }
 }
 
-fn default_home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
-        return Ok(PathBuf::from(home));
+/// Where the wrapper's own diagnostics go once the harness owns the screen.
+fn wrapper_log_path(home: &Path) -> PathBuf {
+    home.join("freechatcode").join("freechatcode.log")
+}
+
+/// Take the wrapper's own voice off the screen the moment the harness owns it,
+/// and give it back when the harness is done.
+///
+/// The bridge hands the terminal to the harness at 0.00s and keeps writing to
+/// its own stdout and stderr: `browser ready in 5.5s` as the page warms,
+/// `reply settled after 20 polls` at the end of every turn, and the browser's
+/// own notes in between. While the harness renders an alternate-screen TUI
+/// there is no cursor to share, so each of those lines is painted wherever the
+/// TUI last drew — which is the prompt box the user is typing into. The report
+/// was exactly that: a screenshot of `freechatcode: reply settled after 20
+/// polls (…)` sitting in Codewhale's prompt box.
+///
+/// The harness already holds the terminal by the time this runs — its stdio was
+/// duplicated at `spawn()` — so repointing the wrapper's own fd 1 and fd 2
+/// cannot reach it. From here the wrapper's diagnostics go to a log file and
+/// the screen belongs to the harness alone. When the harness exits, the saved
+/// descriptors are put back so the wrapper can still report a failed run.
+struct ScreenHandover {
+    log: PathBuf,
+    saved: Vec<(i32, std::fs::File)>,
+}
+
+impl ScreenHandover {
+    /// Redirect whatever the wrapper writes to a terminal into `log`. Returns
+    /// `None` when neither stdout nor stderr is a terminal: nothing is sharing
+    /// a screen, and a script that captured those streams still wants the lines
+    /// where it put them.
+    fn take(log: PathBuf) -> Option<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut targets = Vec::new();
+        if std::io::stdout().is_terminal() {
+            targets.push(1);
+        }
+        if std::io::stderr().is_terminal() {
+            targets.push(2);
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Owner-only: the log carries the same URLs and diagnostics the audit
+        // log does.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log)
+            .ok()?;
+        let mut saved = Vec::new();
+        for fd in targets {
+            // SAFETY: dup(2)/dup2(2) on the wrapper's own descriptors. `copy`
+            // is a fresh duplicate taken before the original is repointed, and
+            // it is closed again in `put_back`.
+            unsafe {
+                let copy = libc::dup(fd);
+                if copy < 0 {
+                    continue;
+                }
+                if libc::dup2(file.as_raw_fd(), fd) < 0 {
+                    libc::close(copy);
+                    continue;
+                }
+                saved.push((fd, std::fs::File::from_raw_fd(copy)));
+            }
+        }
+        if saved.is_empty() {
+            return None;
+        }
+        Some(Self { log, saved })
     }
-    dirs::home_dir()
-        .map(|home| home.join(".codewhale"))
-        .context("could not resolve the Codewhale home directory")
+
+    /// Put the wrapper's own stdout/stderr back on the terminal. Idempotent, so
+    /// an explicit call and the `Drop` backstop cannot fight.
+    fn put_back(&mut self) {
+        use std::os::fd::AsRawFd;
+        for (fd, saved) in self.saved.drain(..) {
+            // SAFETY: restoring the descriptor this struct saved from the same
+            // fd, which nothing else repointed in between.
+            unsafe {
+                libc::dup2(saved.as_raw_fd(), fd);
+            }
+        }
+    }
+}
+
+impl Drop for ScreenHandover {
+    fn drop(&mut self) {
+        self.put_back();
+    }
+}
+
+/// One-time move of the first release's DeepSeek profile/audit directory into
+/// the per-provider layout, so a signed-in browser session is not lost.
+fn migrate_provider_dirs(home: &Path) {
+    let legacy = home.join("deepseek-chat");
+    let current = home.join("providers").join("deepseek");
+    if legacy.exists() && !current.exists() {
+        if let Some(parent) = current.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::rename(&legacy, &current) {
+            eprintln!(
+                "freechatcode: could not migrate {} to {}: {error}",
+                legacy.display(),
+                current.display()
+            );
+        }
+    }
+}
+
+/// Check each configured (or the one named) provider: can a browser open, and is
+/// the composer present? This is the "set up one provider at a time" path — it
+/// never types anything, it only verifies reachability and sign-in.
+async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Result<()> {
+    let providers: Vec<&Provider> = match filter {
+        Some(id) => match config.provider(id) {
+            Some(provider) => vec![provider],
+            None => bail!(
+                "no provider named {id}; configured: {}",
+                config
+                    .providers
+                    .iter()
+                    .map(|provider| provider.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        None => config.providers.iter().collect(),
+    };
+    let cdp_endpoint = config.browser.cdp_endpoint.clone();
+    for provider in providers {
+        println!("Checking provider {} ({})…", provider.name, provider.id);
+        let browser = make_browser(
+            config,
+            provider,
+            home,
+            config.browser.profile_dir.clone().map(PathBuf::from),
+            cdp_endpoint.clone(),
+            provider.chat.url.clone(),
+        );
+        match browser.ensure_open().await {
+            Ok(()) => {
+                println!("  OK — browser opened and the composer is present.");
+                browser.shutdown().await;
+            }
+            Err(error) => {
+                let failure = browser.classify(&error).await;
+                println!(
+                    "  FAILED [{} / {}]: {}",
+                    failure.kind,
+                    failure.blame,
+                    first_line(&error)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_home() -> Result<PathBuf> {
+    let home = if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
+        PathBuf::from(home)
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".codewhale"))
+            .context("could not resolve the Codewhale home directory")?
+    };
+    // One-time migration from the pre-rename project directory.
+    config::migrate_legacy_home(&home);
+    Ok(home)
 }
 
 async fn set_private_directory(path: &Path) -> Result<()> {
@@ -1738,28 +675,6 @@ async fn set_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort user notification (a desktop "toast"). Always mirrors to stderr;
-/// the desktop popup goes through `notify-send` and is skipped when disabled or
-/// unavailable.
-fn notify(enabled: bool, summary: &str, body: &str) {
-    eprintln!("deepchatcode: {summary} — {body}");
-    if !enabled {
-        return;
-    }
-    let _ = std::process::Command::new("notify-send")
-        .args([
-            "--app-name",
-            "DeepChatCode",
-            "--expire-time",
-            "6000",
-            summary,
-            body,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
 async fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -1781,6 +696,13 @@ async fn run() -> Result<()> {
             print_turns(&default_home()?, limit)?;
             return Ok(());
         }
+        Some(Commands::Doctor { provider }) => {
+            let home = default_home()?;
+            let config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            run_doctor(&config, &home, provider.as_deref()).await?;
+            return Ok(());
+        }
         Some(Commands::Tui) => {
             run_lobby(args.codewhale_bin.as_deref()).await?;
             (None, args.codewhale_args.clone())
@@ -1793,6 +715,7 @@ async fn run() -> Result<()> {
     };
 
     let home = default_home()?;
+    migrate_provider_dirs(&home);
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -1804,15 +727,37 @@ async fn run() -> Result<()> {
         config.browser.record_video_size = Some(size);
     }
 
+    // Resolve the model and its provider for this run. One tab per run for now:
+    // `--model` picks a model (and therefore its provider), otherwise the first
+    // model of the first provider is used. All of that provider's models are
+    // served; multi-provider multi-tab is a follow-up.
+    let model_id = args
+        .model
+        .clone()
+        .or_else(|| config.default_model_id().map(str::to_owned))
+        .context("no provider or model is configured")?;
+    let (active_provider, _) = config.model(&model_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--model must name a configured model (got {model_id}); configured: {}",
+            config
+                .all_models()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let provider = active_provider.clone();
+
     // Effective values: CLI flag > environment (merged by clap) > config > default.
     let chat_url = args
         .chat_url
         .clone()
-        .unwrap_or_else(|| config.chat.url.clone());
-    if !config.chat.accepts_url(&chat_url) {
+        .unwrap_or_else(|| provider.chat.url.clone());
+    if !provider.chat.accepts_url(&chat_url) {
         bail!(
             "--chat-url must be HTTPS on one of: {}",
-            config.chat.allowed_hosts.join(", ")
+            provider.chat.allowed_hosts.join(", ")
         );
     }
     if config.transport.mode == TransportMode::Api && config.transport.api.url.trim().is_empty() {
@@ -1835,7 +780,7 @@ async fn run() -> Result<()> {
         PathBuf::from(path)
     } else {
         if remembered.is_some() {
-            eprintln!("deepchatcode: the remembered codewhale binary is gone; rediscovering");
+            eprintln!("freechatcode: the remembered codewhale binary is gone; rediscovering");
         }
         setup::find_codewhale_binary(None)?
     };
@@ -1843,28 +788,22 @@ async fn run() -> Result<()> {
     if pinned.is_none()
         && let Err(error) = config::remember_binary(&config_path, &codewhale_bin)
     {
-        eprintln!("deepchatcode: could not remember the codewhale binary: {error}");
+        eprintln!("freechatcode: could not remember the codewhale binary: {error}");
     }
 
-    let profile = args
-        .profile_dir
-        .clone()
-        .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from))
-        .unwrap_or_else(|| home.join("deepseek-chat").join("browser"));
     let cdp_endpoint = args
         .cdp_endpoint
         .clone()
         .or_else(|| config.browser.cdp_endpoint.clone());
+    // One audit log for the whole relay, however many providers are running.
+    let audit = JsonlAudit::create(&home.join("freechatcode").join("audit")).await?;
 
-    let audit = JsonlAudit::create(&home.join("deepseek-chat").join("audit")).await?;
-
-    // Resolve the Codewhale session this run will use, and the DeepSeek Chat
-    // conversation linked to it (if any).
+    // Resolve the Codewhale session this run will use (shared across providers).
     let workspace = std::env::current_dir().context("resolve the working directory")?;
     let project_dir = workspace.to_string_lossy().into_owned();
     let sessions_dir = home.join("sessions");
     let links = Arc::new(
-        SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+        SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
             .map_err(|error| anyhow::anyhow!(error))?,
     );
     let session = match codewhale_intent(&codewhale_args) {
@@ -1874,125 +813,151 @@ async fn run() -> Result<()> {
         }
         Intent::Auto => sessions::resolve_session_id(&sessions_dir, &workspace, None),
     };
-    // A stored link is only trusted if it is still a resumable URL on an
-    // allowed host; anything else is treated as no link at all.
-    let linked_url = session
-        .as_ref()
-        .and_then(|id| links.get(id).ok().flatten())
-        .filter(|url| config.chat.is_resumable_url(url));
-    let had_link = linked_url.is_some();
-    if let Some(url) = &linked_url {
-        println!("Resuming the DeepSeek Chat conversation linked to this Codewhale session: {url}");
-    } else if session.is_some() {
-        println!("No linked conversation yet; opening a new DeepSeek Chat session.");
-    }
-    let open_url = linked_url.unwrap_or_else(|| chat_url.clone());
 
-    let browser = Arc::new(BrowserChat {
-        spec: BrowserSpec {
-            config: config.clone(),
-            url: open_url,
-            profile,
-            cdp_endpoint,
-        },
-        session: Mutex::new(None),
-        transport: config.transport.mode,
-        api: config.transport.api.clone(),
-        api_timeout: Duration::from_secs(config.transport.api.timeout_secs.max(1)),
-        keep_alive: config.browser.keep_alive,
-        response_timeout: config.timeouts.response(),
-        model_label: Mutex::new(None),
-        resume_url: Mutex::new(String::new()),
-        last_http_status: Mutex::new(None),
-    });
-    // Take the terminal off the wrapper's stdin *before* the browser exists, so
+    // Take the terminal off the wrapper's stdin *before* any browser exists, so
     // the driver library has nothing to snapshot and nothing to write back onto
     // the TUI's line discipline. See `take_terminal_off_stdin`.
     let terminal = take_terminal_off_stdin();
-    // Warm the browser *while* Codewhale boots rather than before it. Nothing
-    // needs the page until the first turn, and waiting here put the whole cold
-    // start — Playwright driver, Chromium, navigation, the composer probe — in
-    // front of the TUI the user is watching. The diagnosis is not traded away:
-    // a browser that cannot come up still stops the run with the same classified
-    // message and the same record, and it stops it as soon as the failure is
-    // known instead of after an arbitrary wait.
     let startup = std::time::Instant::now();
-    let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel::<String>();
-    let stale_link = Arc::new(AtomicBool::new(false));
-    {
-        let browser = Arc::clone(&browser);
-        let stale_link = Arc::clone(&stale_link);
-        let links = Arc::clone(&links);
-        let session = session.clone();
-        let notifications = config.relay.desktop_notifications;
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            if let Err(error) = browser.ensure_open().await {
-                // The bridge could not even get a browser. Say why, and record it:
-                // "it never started" is exactly the question a log should answer.
-                let failure = browser.classify(&error).await;
-                let (kind, blame) = (failure.kind.clone(), failure.blame.clone());
-                let startup_log: Arc<dyn TurnSink> = Arc::new(TurnLog {
-                    links: Arc::clone(&links),
-                    session: session.clone(),
-                });
-                let _ = startup_log
-                    .record(TurnRecord {
-                        finish_reason: "error".to_owned(),
-                        failure: Some(failure),
-                        ..TurnRecord::default()
-                    })
-                    .await;
-                let condensed = first_line(&error);
-                let more = if error.lines().count() > 1 {
-                    " (full text in the relay audit log)"
-                } else {
-                    ""
-                };
-                let _ = failed_tx.send(format!(
-                    "could not open the browser [{kind} / {blame}]: {condensed}{more}"
-                ));
-                return;
-            }
-            eprintln!(
-                "deepchatcode: browser ready in {:.1}s",
-                started.elapsed().as_secs_f64()
+    let (failed_tx, mut failed_rx) =
+        tokio::sync::mpsc::channel::<String>(config.providers.len().max(1));
+
+    // One tab (and one conversation) per provider, all served by this one relay.
+    let profile_override = args
+        .profile_dir
+        .clone()
+        .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from));
+    let mut route_groups: Vec<RouteGroup> = Vec::new();
+    let mut browsers: Vec<Arc<BrowserChat>> = Vec::new();
+    for entry in &config.providers {
+        // `--chat-url` overrides the active provider's base URL; every other
+        // provider opens at its configured URL.
+        let base_url = if entry.id == provider.id {
+            chat_url.clone()
+        } else {
+            entry.chat.url.clone()
+        };
+        // A stored link is trusted only while it is still resumable on this
+        // provider's host; anything else is treated as no link at all.
+        let linked_url = session
+            .as_ref()
+            .and_then(|id| links.get(id, &entry.id).ok().flatten())
+            .filter(|url| entry.chat.is_resumable_url(url));
+        let had_link = linked_url.is_some();
+        if let Some(url) = &linked_url {
+            println!(
+                "Resuming the {} conversation linked to this Codewhale session: {url}",
+                entry.name
             );
-            // The Codewhale session is the source of truth: verify the linked
-            // conversation actually exists before trusting it. If it is gone,
-            // realign from scratch — a new chat, fed the whole session — and tell
-            // the user. Checked here because this is where the page exists.
-            if had_link && !browser.link_available().await {
-                stale_link.store(true, Ordering::SeqCst);
-                notify(
-                    notifications,
-                    "DeepSeek chat link is stale",
-                    "The linked conversation is no longer reachable. Opening a new chat and re-feeding the Codewhale session.",
+        } else if session.is_some() {
+            println!(
+                "No linked {} conversation yet; opening a new one.",
+                entry.name
+            );
+        }
+        let open_url = linked_url.unwrap_or(base_url);
+
+        let browser = Arc::new(make_browser(
+            &config,
+            entry,
+            &home,
+            profile_override.clone(),
+            cdp_endpoint.clone(),
+            open_url,
+        ));
+        browsers.push(Arc::clone(&browser));
+        let stale_link = Arc::new(AtomicBool::new(false));
+        {
+            let browser = Arc::clone(&browser);
+            let stale_link = Arc::clone(&stale_link);
+            let links = Arc::clone(&links);
+            let session = session.clone();
+            let notifications = config.relay.desktop_notifications;
+            let failed_tx = failed_tx.clone();
+            let provider_name = entry.name.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                if let Err(error) = browser.ensure_open().await {
+                    // "It never started" is exactly the question a log answers.
+                    let failure = browser.classify(&error).await;
+                    let (kind, blame) = (failure.kind.clone(), failure.blame.clone());
+                    let startup_log: Arc<dyn TurnSink> = Arc::new(TurnLog {
+                        links: Arc::clone(&links),
+                        session: session.clone(),
+                    });
+                    let _ = startup_log
+                        .record(TurnRecord {
+                            finish_reason: "error".to_owned(),
+                            failure: Some(failure),
+                            ..TurnRecord::default()
+                        })
+                        .await;
+                    let condensed = first_line(&error);
+                    let more = if error.lines().count() > 1 {
+                        " (full text in the relay audit log)"
+                    } else {
+                        ""
+                    };
+                    let _ = failed_tx
+                        .send(format!(
+                            "could not open the {provider_name} browser [{kind} / {blame}]: {condensed}{more}"
+                        ))
+                        .await;
+                    return;
+                }
+                eprintln!(
+                    "freechatcode: {provider_name} browser ready in {:.1}s",
+                    started.elapsed().as_secs_f64()
                 );
-            }
+                // The Codewhale session is the source of truth: verify the linked
+                // conversation still exists before trusting it.
+                if had_link && !browser.link_available().await {
+                    stale_link.store(true, Ordering::SeqCst);
+                    notify(
+                        notifications,
+                        &format!("{provider_name} chat link is stale"),
+                        "The linked conversation is no longer reachable. Opening a new chat and re-feeding the Codewhale session.",
+                    );
+                }
+            });
+        }
+
+        // Keep the browser alive between turns: a browser that is closed or
+        // crashes should come back on its own, not at the next prompt.
+        if config.browser.keep_alive && config.browser.liveness_check_secs > 0 {
+            let watcher = Arc::clone(&browser);
+            let interval = Duration::from_secs(config.browser.liveness_check_secs);
+            tokio::spawn(async move { watcher.watch_browser(interval).await });
+        }
+
+        let ui = Arc::new(UrlLinkingChat {
+            inner: Arc::clone(&browser),
+            links: Arc::clone(&links),
+            session: session.clone(),
+            sessions_dir: sessions_dir.clone(),
+            workspace: workspace.clone(),
+            chat: entry.chat.clone(),
+            provider_id: entry.id.clone(),
+            linked: AtomicBool::new(false),
+            stale_link: Arc::clone(&stale_link),
+        });
+        let models: Vec<ModelSpec> = entry
+            .models
+            .iter()
+            .map(|model| ModelSpec {
+                id: model.id.clone(),
+                owned_by: entry.id.clone(),
+                name: model.name.clone(),
+                toggles: model.toggles.clone(),
+            })
+            .collect();
+        route_groups.push(RouteGroup {
+            ui,
+            start_fresh: !had_link,
+            models,
         });
     }
 
-    // Keep the browser alive between turns: a browser that is closed or crashes
-    // should come back on its own, not at the next prompt.
-    if config.browser.keep_alive && config.browser.liveness_check_secs > 0 {
-        let watcher = Arc::clone(&browser);
-        let interval = Duration::from_secs(config.browser.liveness_check_secs);
-        tokio::spawn(async move { watcher.watch_browser(interval).await });
-    }
-
-    let start_fresh = !had_link;
-
-    let ui = Arc::new(UrlLinkingChat {
-        inner: Arc::clone(&browser),
-        links: Arc::clone(&links),
-        session: session.clone(),
-        sessions_dir,
-        workspace,
-        chat: config.chat.clone(),
-        linked: AtomicBool::new(false),
-        stale_link: Arc::clone(&stale_link),
-    });
     let turns: Arc<dyn TurnSink> = Arc::new(TurnLog {
         links: Arc::clone(&links),
         session: session.clone(),
@@ -2020,13 +985,15 @@ async fn run() -> Result<()> {
     };
     let system_prompt: Arc<str> = Arc::from(template.replace("{project_dir}", &project_dir));
     let app = router(
-        ServerState::with_options(
+        ServerState::with_routes(
             token.clone(),
-            ui.clone(),
+            route_groups,
             audit,
             BridgeOptions {
                 tools: tool_policy,
-                start_fresh,
+                // Per-tab freshness lives on each RouteGroup; this field only
+                // drives the single-tab convenience constructor.
+                start_fresh: false,
                 system_prompt,
                 forward_system_prompt: config.relay.forward_system_prompt,
             },
@@ -2036,15 +1003,7 @@ async fn run() -> Result<()> {
     let server = tokio::spawn(async move { serve(listener, app).await });
     let base_url = format!("http://{address}/v1");
 
-    let model_id = args.model.clone().unwrap_or_else(|| MODEL_ID.to_owned());
-    if !serves_model(&model_id) {
-        bail!(
-            "--model must be one of: {}",
-            [MODEL_ID, PRO_MODEL_ID].join(", ")
-        );
-    }
-
-    println!("Starting Codewhale with the DeepSeek Chat browser route.");
+    println!("Starting Codewhale with the chat browser route.");
     println!("The local relay listens only on {address}; no browser CORS access is enabled.");
     println!("Platform credentials and cookies remain in the browser profile.");
     println!(
@@ -2072,44 +1031,66 @@ async fn run() -> Result<()> {
         println!("[browser] keep_alive = false: the browser closes after every turn.");
     }
 
-    // Codewhale still gets the terminal on stdin; the wrapper just no longer
+    // The harness is about to own the terminal, and from the next line on the
+    // user will not see the wrapper's own diagnostics on it. Say where they
+    // will be. See `ScreenHandover`.
+    let log_path = wrapper_log_path(&home);
+    if std::io::stdout().is_terminal() {
+        println!(
+            "freechatcode: the screen goes to the harness; this run's logs: {}",
+            log_path.display()
+        );
+    }
+
+    // The harness still gets the terminal on stdin; the wrapper just no longer
     // holds it itself.
     let child_stdin = match terminal {
         Some(terminal) => Stdio::from(terminal),
         None => Stdio::inherit(),
     };
-    let mut child = Command::new(&codewhale_bin)
-        .args([
-            OsString::from("--provider"),
-            OsString::from("openai"),
-            OsString::from("--model"),
-            OsString::from(model_id),
-            OsString::from("--base-url"),
-            OsString::from(base_url),
-            OsString::from("--api-key"),
-            OsString::from(token),
-        ])
+    let harness_kind = args
+        .harness
+        .unwrap_or_else(|| HarnessKind::detect(&codewhale_bin));
+    let spawn = harness::spawn_contract(harness_kind, &base_url, &token, &model_id)?;
+    let mut command = Command::new(&codewhale_bin);
+    command.args(&spawn.argv);
+    for (key, value) in &spawn.envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .args(codewhale_args)
         .stdin(child_stdin)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("launch Codewhale executable {:?}", codewhale_bin))?;
+        .with_context(|| {
+            format!(
+                "launch {:?} harness executable {:?}",
+                harness_kind, codewhale_bin
+            )
+        })?;
+    // The harness's stdio was duplicated above, so it keeps the terminal. The
+    // wrapper gives up its own now, so nothing it writes can land on the TUI.
+    let mut handover = ScreenHandover::take(log_path.clone());
+    let harness_name = match harness_kind {
+        HarnessKind::Codewhale => "Codewhale",
+        HarnessKind::Opencode => "opencode",
+    };
     eprintln!(
-        "deepchatcode: Codewhale started at {:.2}s (browser warming in parallel)",
+        "freechatcode: {harness_name} started at {:.2}s (browser warming in parallel)",
         startup.elapsed().as_secs_f64()
     );
 
     let status = tokio::select! {
         status = child.wait() => status.context("wait for Codewhale")?,
         failure = async {
-            match (&mut failed_rx).await {
-                // Only an actual message is a failure. A sender dropped after a
+            match failed_rx.recv().await {
+                // Only an actual message is a failure. Senders dropped after a
                 // successful warm-up must not read as one, so this branch simply
                 // never resolves in that case.
-                Ok(message) => message,
-                Err(_) => std::future::pending::<String>().await,
+                Some(message) => message,
+                None => std::future::pending::<String>().await,
             }
         } => {
             // Codewhale is already up, but nothing can be answered without a
@@ -2118,7 +1099,9 @@ async fn run() -> Result<()> {
             child.kill().await.context("stop Codewhale")?;
             child.wait().await.context("reap Codewhale")?;
             server.abort();
-            browser.shutdown().await;
+            for browser in &browsers {
+                browser.shutdown().await;
+            }
             bail!("{failure}");
         }
         signal = tokio::signal::ctrl_c() => {
@@ -2128,7 +1111,19 @@ async fn run() -> Result<()> {
         }
     };
     server.abort();
-    browser.shutdown().await;
+    for browser in &browsers {
+        browser.shutdown().await;
+    }
+    // The harness has released the screen. Put the wrapper's own streams back
+    // so its last words — including a failed-exit report — land on the
+    // terminal, not in the log file.
+    if let Some(handover) = handover.as_mut() {
+        handover.put_back();
+        println!(
+            "freechatcode: the harness exited; this run's logs are in {}",
+            handover.log.display()
+        );
+    }
     if !status.success() {
         bail!("Codewhale exited with {status}");
     }
@@ -2138,28 +1133,51 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("deepchatcode: {error:#}");
+        eprintln!("freechatcode: {error:#}");
         std::process::exit(1);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::browser::*;
     use super::*;
+    use freechatcode::config::{BrowserMode, Selectors, Toggle};
+    use playwright_rs::Playwright;
+    use playwright_rs::protocol::{BrowserContextOptions, Page};
+
+    const TEST_MODEL_ID: &str = "deepseek-chat";
+    const TEST_PRO_MODEL_ID: &str = "deepseek-pro";
 
     #[test]
     fn chat_url_acceptance_follows_config() {
         let config = Config::defaults();
-        assert!(config.chat.accepts_url("https://chat.deepseek.com/"));
-        assert!(!config.chat.accepts_url("http://chat.deepseek.com/"));
         assert!(
-            !config
+            config.providers[0]
+                .chat
+                .accepts_url("https://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("http://chat.deepseek.com/")
+        );
+        assert!(
+            !config.providers[0]
                 .chat
                 .accepts_url("https://chat.deepseek.com.attacker.invalid/")
         );
-        assert!(!config.chat.accepts_url("https://user@chat.deepseek.com/"));
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://user@chat.deepseek.com/")
+        );
         // The old deepseek.ai host is no longer trusted by default.
-        assert!(!config.chat.accepts_url("https://deepseek.ai/chat"));
+        assert!(
+            !config.providers[0]
+                .chat
+                .accepts_url("https://deepseek.ai/chat")
+        );
     }
 
     #[test]
@@ -2205,7 +1223,7 @@ mod tests {
 
     #[test]
     fn default_selectors_support_a_test_page_without_platform_private_endpoints() {
-        let selectors = Config::defaults().selectors;
+        let selectors = Config::defaults().providers[0].selectors.clone();
         assert!(selectors.composer.contains("textarea"));
         assert!(selectors.assistant.contains("ds-markdown"));
         assert!(selectors.send.contains("send"));
@@ -2278,6 +1296,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2355,6 +1374,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2418,6 +1438,7 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: "https://chat.deepseek.com".to_owned(),
                 profile: PathBuf::from("/nonexistent-test-profile"),
                 cdp_endpoint: None,
@@ -2529,7 +1550,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -2559,11 +1581,11 @@ mod tests {
                 forward_system_prompt: false,
             },
         )
-        // Record into the real turn log, so `deepchatcode turns` can be checked
+        // Record into the real turn log, so `freechatcode turns` can be checked
         // against rows a live turn actually wrote.
         .with_turns({
             let links = Arc::new(
-                SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+                SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
                     .expect("open link store"),
             );
             let session = sessions::resolve_session_id(&home.join("sessions"), &workspace, None);
@@ -2598,7 +1620,7 @@ mod tests {
             .post(&url)
             .bearer_auth("live-token")
             .json(&json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": ask}],
                 "tools": tools,
             }))
@@ -2626,7 +1648,7 @@ mod tests {
             .post(&url)
             .bearer_auth("live-token")
             .json(&json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [
                     {"role": "user", "content": ask},
                     {"role": "assistant", "content": null, "tool_calls": message["tool_calls"]},
@@ -2668,7 +1690,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -2833,7 +1856,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -2859,9 +1883,12 @@ mod tests {
 
         eprintln!("[pro] page chips at rest: {:?}", chips(&ui, &page).await);
 
-        ui.set_reasoning(false)
-            .await
-            .expect("the chat model must be reachable");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("the chat model must be reachable");
         let chat = chips(&ui, &page).await;
         eprintln!("[pro] after chat: {chat:?}");
         assert!(
@@ -2869,9 +1896,12 @@ mod tests {
             "the plain chat model must leave DeepThink off, saw {chat:?}"
         );
 
-        ui.set_reasoning(true)
-            .await
-            .expect("the pro model must engage");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: true,
+        }])
+        .await
+        .expect("the pro model must engage");
         let pro = chips(&ui, &page).await;
         eprintln!("[pro] after pro: {pro:?}");
         assert!(
@@ -2894,9 +1924,12 @@ mod tests {
         );
 
         // And back: a chat turn must not inherit pro.
-        ui.set_reasoning(false)
-            .await
-            .expect("disengaging must work too");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("disengaging must work too");
         let back = chips(&ui, &page).await;
         eprintln!("[pro] after switching back: {back:?}");
         assert!(
@@ -2907,7 +1940,7 @@ mod tests {
     }
 
     /// Live: the relay itself engages the pro mode. The test above drives
-    /// `set_reasoning` directly; this one goes through the real router, so the
+    /// `set_model_state` directly; this one goes through the real router, so the
     /// composition — a `deepseek-pro` request arriving over HTTP and leaving the
     /// page in DeepThink — is verified rather than assumed.
     #[tokio::test]
@@ -2921,7 +1954,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -2946,7 +1980,12 @@ mod tests {
             .clone();
         // Start from the plain chat model, so an engaged control can only be the
         // relay's doing.
-        ui.set_reasoning(false).await.expect("start in chat mode");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("start in chat mode");
         let before = chips(&ui, &page).await;
         eprintln!("[relay] chips before: {before:?}");
         assert!(!before.contains("DeepThink=on"), "{before:?}");
@@ -2967,7 +2006,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": PRO_MODEL_ID,
+                "model": TEST_PRO_MODEL_ID,
                 "messages": [{"role": "user", "content": "Reply with exactly the word ELEVEN and nothing else."}],
                 "stream": false,
             }))
@@ -2997,7 +2036,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": "Reply with exactly the word TWELVE and nothing else."}],
                 "stream": false,
             }))
@@ -3036,7 +2075,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3067,7 +2107,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": "Write exactly three short sentences about the ocean. Nothing else."}],
                 "stream": true,
             }))
@@ -3178,7 +2218,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3234,7 +2275,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3259,10 +2301,18 @@ mod tests {
             .clone();
 
         // What the relay does for a `deepseek-pro` request, in order.
-        ui.set_reasoning(false).await.expect("start in chat mode");
-        ui.set_reasoning(true)
-            .await
-            .expect("the pro model must engage");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: false,
+        }])
+        .await
+        .expect("start in chat mode");
+        ui.set_model_state(&[Toggle {
+            selector: ui.selectors().thinking_toggle.trim().to_owned(),
+            on: true,
+        }])
+        .await
+        .expect("the pro model must engage");
         let reply = ui
             .send(
                 "Reply with exactly the word THIRTEEN and nothing else.",
@@ -3304,7 +2354,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3334,7 +2385,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [
                     {"role": "system", "content": "BRIEFING-MARKER: the project rules and the tool catalog live here."},
                     {"role": "user", "content": "You can call tools you know"},
@@ -3404,7 +2455,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3432,7 +2484,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{
                     "role": "user",
                     "content": "Hello, I want to discuss the name of this project, a better one, and also adding support for Gemini app, and google ai mode, research, run terminal commands, read files, read docs",
@@ -3545,19 +2597,19 @@ mod tests {
         let profile_dir = deps.parent().expect("profile directory");
         let target = profile_dir.parent().unwrap_or(profile_dir);
         let cli = [
-            target.join("release/deepchatcode"),
-            profile_dir.join("deepchatcode"),
+            target.join("release/freechatcode"),
+            profile_dir.join("freechatcode"),
         ]
         .into_iter()
         .find(|candidate| candidate.exists())
-        .unwrap_or_else(|| profile_dir.join("deepchatcode"));
+        .unwrap_or_else(|| profile_dir.join("freechatcode"));
         let help = std::process::Command::new(&cli)
             .arg("--help")
             .output()
             .unwrap_or_else(|error| panic!("run {}: {error}", cli.display()));
         assert!(
             String::from_utf8_lossy(&help.stdout).contains("--mode"),
-            "{} is stale (no --mode); rebuild it: cargo build --bin deepchatcode",
+            "{} is stale (no --mode); rebuild it: cargo build --bin freechatcode",
             cli.display()
         );
         cli
@@ -3596,7 +2648,7 @@ mod tests {
     /// second, independent one-shot cannot recall the first, and the honest
     /// behaviour is to start clean rather than inherit a stranger's conversation.
     /// Cross-run memory is a session feature: it is what an interactive
-    /// `deepchatcode launch codewhale` has and a one-shot does not.
+    /// `freechatcode launch codewhale` has and a one-shot does not.
     ///
     /// What this pins is therefore two things: a tool really runs in the
     /// workspace, and unrelated runs do not leak state into each other.
@@ -3799,7 +2851,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -3855,7 +2908,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: Some("http://127.0.0.1:9222".to_owned()),
             },
@@ -3957,13 +3011,14 @@ mod tests {
     async fn the_turn_log_writes_a_failure_row_with_its_diagnosis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let links = Arc::new(
-            SessionLinks::open(&dir.path().join("deepchatcode/sessions.db")).expect("open"),
+            SessionLinks::open(&dir.path().join("freechatcode/sessions.db")).expect("open"),
         );
         let log = TurnLog {
             links: Arc::clone(&links),
             session: Some("sess-1".to_owned()),
         };
         log.record(TurnRecord {
+            provider_id: None,
             model_label: Some("DeepThink=off, Search=on".to_owned()),
             finish_reason: "error".to_owned(),
             tool_calls: false,
@@ -3993,11 +3048,12 @@ mod tests {
     /// Build a `BrowserChat` that never opens anything, for classification tests.
     fn classifier_for(url: &str) -> BrowserChat {
         let mut config = Config::defaults();
-        config.chat.url = url.to_owned();
+        config.providers[0].chat.url = url.to_owned();
         BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: PathBuf::from("/nonexistent"),
                 cdp_endpoint: None,
             },
@@ -4018,7 +3074,7 @@ mod tests {
     /// holds whether or not the machine has a network at all.
     #[tokio::test]
     async fn a_silent_page_with_no_dns_is_not_the_services_fault() {
-        let ui = classifier_for("https://deepchatcode-test.invalid");
+        let ui = classifier_for("https://freechatcode-test.invalid");
         let failure = ui.classify("no visible assistant reply within 300s").await;
         assert_eq!(failure.kind, "dns");
         assert_eq!(failure.blame, "network");
@@ -4105,7 +3161,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4129,7 +3186,7 @@ mod tests {
         let conversation = ui.live_url().await.expect("a live page");
         eprintln!("[persist] conversation={conversation}");
         assert!(
-            config.chat.is_resumable_url(&conversation),
+            config.providers[0].chat.is_resumable_url(&conversation),
             "a real turn must leave a conversation URL: {conversation}"
         );
 
@@ -4160,15 +3217,15 @@ mod tests {
 
     /// Diagnostic: open a page and print what it actually shows. When a turn
     /// goes silent, "what is the page displaying?" is the question that matters.
-    /// Set `DEEPCHATCODE_INSPECT_URL` to the conversation (defaults to the chat
+    /// Set `FREECHATCODE_INSPECT_URL` to the conversation (defaults to the chat
     /// URL). Runs on a copy of the profile, so it never disturbs a live session.
     #[tokio::test]
     #[ignore = "diagnostic: inspects a live page; needs a signed-in profile"]
     async fn live_inspect_page() {
         let home = default_home().expect("codewhale home");
         let config = Config::load(Some(&config::user_config_path(&home))).expect("config");
-        let url =
-            std::env::var("DEEPCHATCODE_INSPECT_URL").unwrap_or_else(|_| config.chat.url.clone());
+        let url = std::env::var("FREECHATCODE_INSPECT_URL")
+            .unwrap_or_else(|_| config.providers[0].chat.url.clone());
         let (_dir, profile) = profile_copy();
 
         let playwright = Playwright::launch().await.expect("Playwright driver");
@@ -4189,7 +3246,7 @@ mod tests {
         page.goto(&url, None).await.expect("navigate");
         tokio::time::sleep(Duration::from_secs(6)).await;
 
-        let assistants = page.locator(&config.selectors.assistant);
+        let assistants = page.locator(&config.providers[0].selectors.assistant);
         eprintln!(
             "[inspect] {url}\n[inspect] assistant elements: {}",
             assistants.count().await.unwrap_or(0)
@@ -4208,7 +3265,9 @@ mod tests {
                 text.chars().take(400).collect::<String>()
             );
         }
-        let composer = page.locator(&config.selectors.composer).first();
+        let composer = page
+            .locator(&config.providers[0].selectors.composer)
+            .first();
         eprintln!(
             "[inspect] composer visible: {} | enabled: {}",
             composer.is_visible().await.unwrap_or(false),
@@ -4218,7 +3277,7 @@ mod tests {
         // the DOM?", so print exactly what the page keeps mounted. A chat UI
         // that unmounts off-screen messages makes that count stop growing, and
         // this report is how that is diagnosed instead of guessed at.
-        for line in dom_outline(&page, &config.selectors).await {
+        for line in dom_outline(&page, &config.providers[0].selectors).await {
             eprintln!("[inspect] {line}");
         }
         let body = page
@@ -4256,7 +3315,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4284,13 +3344,13 @@ mod tests {
         let mut answered_without_growth = 0_usize;
         for turn in 1..=TURNS {
             let token = format!("W{turn}");
-            let before = mounted_count(&page, &config.selectors).await;
+            let before = mounted_count(&page, &config.providers[0].selectors).await;
             let started = std::time::Instant::now();
             let reply = ui
                 .send(&padded_prompt(&token), turn == 1)
                 .await
                 .unwrap_or_else(|error| panic!("turn {turn} failed: {error}"));
-            let after = mounted_count(&page, &config.selectors).await;
+            let after = mounted_count(&page, &config.providers[0].selectors).await;
             eprintln!(
                 "[window] turn {turn}: {:?} mounted assistant elements {before} -> {after}, reply={reply:?}",
                 started.elapsed()
@@ -4301,7 +3361,7 @@ mod tests {
             );
             if after <= before {
                 answered_without_growth += 1;
-                for line in dom_outline(&page, &config.selectors).await {
+                for line in dom_outline(&page, &config.providers[0].selectors).await {
                     eprintln!("[window]   {line}");
                 }
             }
@@ -4332,7 +3392,8 @@ mod tests {
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: config.chat.url.clone(),
+                provider: config.providers[0].clone(),
+                url: config.providers[0].chat.url.clone(),
                 profile: profile.clone(),
                 cdp_endpoint: None,
             },
@@ -4408,23 +3469,23 @@ mod tests {
         // A visible window so a signed-out profile can be signed in by hand.
         config.browser.headless = false;
         // Optional recording, so a demo clip can be produced from a real turn.
-        if let Ok(dir) = std::env::var("DEEPCHATCODE_RECORD_VIDEO_DIR") {
+        if let Ok(dir) = std::env::var("FREECHATCODE_RECORD_VIDEO_DIR") {
             config.browser.record_video_dir = Some(dir);
         }
-        if let Ok(size) = std::env::var("DEEPCHATCODE_RECORD_VIDEO_SIZE") {
+        if let Ok(size) = std::env::var("FREECHATCODE_RECORD_VIDEO_SIZE") {
             config.browser.record_video_size = Some(size);
         }
-        let prompt = std::env::var("DEEPCHATCODE_DEMO_PROMPT")
+        let prompt = std::env::var("FREECHATCODE_DEMO_PROMPT")
             .unwrap_or_else(|_| "Reply with exactly the word PONG and nothing else.".to_owned());
         let workspace = std::env::current_dir().expect("cwd");
         let sessions_dir = home.join("sessions");
-        let links = SessionLinks::open(&home.join("deepchatcode").join("sessions.db"))
+        let links = SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
             .expect("open link store");
         let session = sessions::resolve_session_id(&sessions_dir, &workspace, None);
         let linked = session
             .as_ref()
-            .and_then(|id| links.get(id).ok().flatten())
-            .filter(|url| config.chat.is_resumable_url(url));
+            .and_then(|id| links.get(id, "deepseek").ok().flatten())
+            .filter(|url| config.providers[0].chat.is_resumable_url(url));
         eprintln!("[live] session={session:?}");
         eprintln!("[live] linked conversation={linked:?}");
         let start_fresh = linked.is_none();
@@ -4432,7 +3493,8 @@ mod tests {
         let ui = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
-                url: linked.unwrap_or_else(|| config.chat.url.clone()),
+                provider: config.providers[0].clone(),
+                url: linked.unwrap_or_else(|| config.providers[0].chat.url.clone()),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
             },
@@ -4495,7 +3557,7 @@ mod tests {
         let conversation = ui.live_url().await.expect("a live page");
         eprintln!("[live] conversation url={conversation}");
         assert!(
-            config.chat.is_resumable_url(&conversation),
+            config.providers[0].chat.is_resumable_url(&conversation),
             "a real turn must leave a resumable conversation URL: {conversation}"
         );
         ui.shutdown().await;
@@ -4503,6 +3565,7 @@ mod tests {
         let resumed = BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
+                provider: config.providers[0].clone(),
                 url: conversation.clone(),
                 profile: home.join("deepseek-chat").join("browser"),
                 cdp_endpoint: None,
@@ -4555,12 +3618,13 @@ mod tests {
     /// explicitly, so the guard has nothing to snapshot and nothing to write
     /// back.
     ///
-    /// This runs the shipped wrapper on a real pty with no Codewhale arguments,
-    /// so Codewhale runs its interactive TUI, and asserts what the user is left
-    /// with once the browser is warm: `ECHO` still clear across consecutive
+    /// This runs the shipped wrapper on a real pty with no harness arguments,
+    /// so the harness runs its interactive TUI, and asserts what the user is
+    /// left with once the browser is warm: `ECHO` still clear across consecutive
     /// samples, the wrapper's own fd 0 not a terminal while the child it spawned
-    /// holds this terminal on fd 0, and a mouse report written to the master not
-    /// coming back as text.
+    /// holds this terminal on fd 0, a mouse report written to the master not
+    /// coming back as text, and — issue #4 — no wrapper diagnostic reaching the
+    /// screen after the wrapper hands it over (they go to its log file instead).
     #[tokio::test]
     #[ignore = "needs a signed-in profile, the network, and a built binary"]
     async fn live_the_wrapper_keeps_the_terminal_raw_for_the_tui() {
@@ -4586,6 +3650,35 @@ mod tests {
         fn tail(output: &[u8]) -> String {
             let start = output.len().saturating_sub(1200);
             String::from_utf8_lossy(&output[start..]).into_owned()
+        }
+
+        /// The byte offset of the last `needle` in `haystack`.
+        fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            if needle.is_empty() || haystack.len() < needle.len() {
+                return None;
+            }
+            (0..=haystack.len() - needle.len())
+                .rev()
+                .find(|&at| &haystack[at..at + needle.len()] == needle)
+        }
+
+        /// The byte offset of the first `needle` in `haystack`.
+        fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            if needle.is_empty() {
+                return None;
+            }
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        }
+
+        /// The wrapper's log path, read from the handover notice it prints on
+        /// the terminal just before it gives the screen to the harness.
+        fn log_path_of(output: &[u8]) -> Option<String> {
+            let text = String::from_utf8_lossy(output);
+            let (_, rest) = text.rsplit_once("this run's logs: ")?;
+            let path = rest.lines().next()?.trim();
+            (!path.is_empty()).then(|| path.to_owned())
         }
 
         /// What `/proc/<pid>/fd/0` points at, and whether that is a terminal.
@@ -4769,6 +3862,16 @@ mod tests {
         let pty = Pty::open();
         eprintln!("[tty] running {} on {}", cli.display(), pty.slave);
 
+        // Once the harness owns the screen the wrapper's own diagnostics go to
+        // this file instead of the terminal (see `ScreenHandover`), so the
+        // warm-up line is read from here. Snapshot its length first: the log is
+        // appended to across runs, and a previous run's line must not satisfy
+        // the check.
+        let expected_log = wrapper_log_path(&default_home().expect("codewhale home"));
+        let logged_before = std::fs::metadata(&expected_log)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
         let slave = std::fs::File::options()
             .read(true)
             .write(true)
@@ -4826,14 +3929,46 @@ mod tests {
         // The guard is only in play once a browser was launched, and the TUI is
         // what needs the terminal: without these, a pass would say nothing.
         assert!(
-            holds(&output, b"browser ready in"),
-            "the browser must be warm for this to be about the guard; output: {}",
-            tail(&output)
-        );
-        assert!(
             holds(&output, b"\x1b[?1006h"),
             "Codewhale must be in its interactive TUI (no mouse tracking seen); output: {}",
             tail(&output)
+        );
+
+        // Issue #4: the wrapper must stop painting on the screen the moment the
+        // harness owns it. Everything after its handover notice belongs to the
+        // harness; one wrapper line there is the bug the user screenshotted.
+        let notice = b"the screen goes to the harness";
+        let at = rfind(&output, notice).expect("the wrapper must announce the screen handover");
+        assert_eq!(
+            log_path_of(&output).as_deref().map(Path::new),
+            Some(expected_log.as_path()),
+            "the handover notice must name the log file this run writes to"
+        );
+        let after = &output[at + notice.len()..];
+        // The prefix every wrapper diagnostic carries. The harness's own TUI
+        // also prints its cwd, and that path happens to contain
+        // `freechatcode` — so require the colon and space the wrapper writes,
+        // not the bare name.
+        const WRAPPER_LINE: &[u8] = b"freechatcode: ";
+        if let Some(leak) = find(after, WRAPPER_LINE) {
+            let from = leak.saturating_sub(80);
+            let to = (leak + 240).min(after.len());
+            panic!(
+                "the wrapper must not write to the screen once the harness owns it (#4); \
+                 it still wrote: {}",
+                String::from_utf8_lossy(&after[from..to])
+            );
+        }
+
+        // And the line it stopped printing on the screen must still exist: the
+        // warm-up is recorded in the log file instead.
+        let logged = std::fs::read(&expected_log).unwrap_or_default();
+        let fresh = &logged[(logged_before as usize).min(logged.len())..];
+        assert!(
+            holds(fresh, b"browser ready in"),
+            "the warm-up must be recorded in {} once the screen is handed over; it held: {}",
+            expected_log.display(),
+            tail(fresh)
         );
 
         // One lucky sample is not evidence: eight consecutive clear samples over

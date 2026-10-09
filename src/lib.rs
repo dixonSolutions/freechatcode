@@ -1,4 +1,4 @@
-//! DeepChatCode — DeepSeek Chat browser relay for Codewhale.
+//! FreeChatCode — DeepSeek Chat browser relay for Codewhale.
 //!
 //! This crate exposes a short-lived loopback OpenAI-compatible endpoint and
 //! relays each completion through the visible DeepSeek Chat page with
@@ -35,13 +35,6 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-pub const MODEL_ID: &str = "deepseek-chat";
-
-/// The reasoning model. Same page, same session — it is `deepseek-chat` with the
-/// page's DeepThink mode engaged, which is how the site itself exposes a
-/// stronger model. Nothing hardcoded beyond the name: the toggle is config.
-pub const PRO_MODEL_ID: &str = "deepseek-pro";
-
 /// The one answer to "what does this cost?".
 ///
 /// A string, and not a rate, because the honest answer on this route is not a
@@ -49,12 +42,6 @@ pub const PRO_MODEL_ID: &str = "deepseek-pro";
 /// there is no per-token bill to report. Everything the wrapper is asked about
 /// pricing returns this, so a caller never has to render "unknown".
 pub const PRICING_LABEL: &str = "Unlimited Chat!";
-
-/// Whether this wrapper serves `id`.
-#[must_use]
-pub fn serves_model(id: &str) -> bool {
-    id == MODEL_ID || id == PRO_MODEL_ID
-}
 /// The instruction text handed to the chat model. Committed and embedded in the
 /// binary; override the path with `[codewhale] system_prompt` in config.
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../assets/system-prompt.md");
@@ -64,6 +51,7 @@ const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
 pub mod config;
+pub mod harness;
 pub mod health;
 pub mod sessions;
 pub mod setup;
@@ -93,16 +81,17 @@ pub trait ChatUi: Send + Sync {
         None
     }
 
-    /// Put the page into the reasoning mode the next turn needs.
+    /// Put the page into the state the model this turn asks for.
     ///
-    /// `deepseek-pro` is not a second endpoint: it is this page with its
-    /// DeepThink control engaged, so the model that answers is decided by page
-    /// state. Called before every turn with the mode that turn asked for, which
-    /// is also how the state is put back. Implementations that cannot reach the
-    /// control must fail: answering a pro request with the plain model while
-    /// claiming otherwise is worse than not answering.
-    async fn set_reasoning(&self, pro: bool) -> Result<(), String> {
-        let _ = pro;
+    /// A model is not a second endpoint: it is a page with a control (a
+    /// reasoning chip, a model dropdown) engaged, so which model answers is
+    /// decided by page state. Called before every turn with the toggles that
+    /// turn's model needs, which is also how the state is put back for the next
+    /// turn. Implementations that cannot reach a requested control must fail:
+    /// answering a pro request with the plain model while claiming otherwise is
+    /// worse than not answering.
+    async fn set_model_state(&self, toggles: &[config::Toggle]) -> Result<(), String> {
+        let _ = toggles;
         Ok(())
     }
 
@@ -173,6 +162,8 @@ impl Failure {
 /// after the fact, and so a failure is a record rather than a silence.
 #[derive(Clone, Debug, Default)]
 pub struct TurnRecord {
+    /// The provider whose tab answered (or failed to answer) the turn.
+    pub provider_id: Option<String>,
     /// The model label the page showed for this turn, when it exposes one.
     pub model_label: Option<String>,
     /// `stop`, `tool_calls`, or `error`.
@@ -275,22 +266,90 @@ impl Default for BridgeOptions {
     }
 }
 
+/// One model the relay serves: its id, the provider it belongs to, and the page
+/// state that selects it.
+#[derive(Clone)]
+pub struct ModelSpec {
+    pub id: String,
+    /// Provider id, reported as `owned_by` in `/v1/models`.
+    pub owned_by: String,
+    pub name: Option<String>,
+    /// Page controls to set before a turn. Empty = the provider's plain model.
+    pub toggles: Vec<config::Toggle>,
+}
+
+/// One conversation (one browser tab) and the models that share it. Models that
+/// differ only by page state — DeepSeek chat vs. pro, say — share one thread, so
+/// they share one relay and one UI.
+#[derive(Clone)]
+pub struct RouteGroup {
+    pub ui: Arc<dyn ChatUi>,
+    /// Whether this tab starts a fresh conversation (no linked conversation to
+    /// resume). When true the first turn feeds the whole transcript.
+    pub start_fresh: bool,
+    pub models: Vec<ModelSpec>,
+}
+
+#[derive(Clone)]
+struct ModelRoute {
+    ui: Arc<dyn ChatUi>,
+    relay: Arc<Mutex<ConversationRelay>>,
+    owned_by: String,
+    name: Option<String>,
+    toggles: Vec<config::Toggle>,
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     token: Arc<str>,
-    relay: Arc<Mutex<ConversationRelay>>,
-    ui: Arc<dyn ChatUi>,
+    /// Ordered `(model_id, route)` pairs, in catalog order.
+    routes: Vec<(String, ModelRoute)>,
     audit: Arc<dyn AuditSink>,
     turns: Arc<dyn TurnSink>,
     options: BridgeOptions,
 }
 
 impl ServerState {
+    /// Build the relay around one or more chat tabs, in catalog order. Each
+    /// [`RouteGroup`] is one conversation; its models are served from it.
+    #[must_use]
+    pub fn with_routes(
+        token: impl Into<Arc<str>>,
+        groups: Vec<RouteGroup>,
+        audit: Arc<dyn AuditSink>,
+        options: BridgeOptions,
+    ) -> Self {
+        let mut routes = Vec::new();
+        for group in groups {
+            let relay = Arc::new(Mutex::new(ConversationRelay::new(group.start_fresh)));
+            for model in group.models {
+                routes.push((
+                    model.id,
+                    ModelRoute {
+                        ui: Arc::clone(&group.ui),
+                        relay: Arc::clone(&relay),
+                        owned_by: model.owned_by,
+                        name: model.name,
+                        toggles: model.toggles,
+                    },
+                ));
+            }
+        }
+        Self {
+            token: token.into(),
+            routes,
+            audit,
+            turns: Arc::new(NoopTurns),
+            options,
+        }
+    }
+
     #[must_use]
     pub fn new(token: impl Into<Arc<str>>, ui: Arc<dyn ChatUi>, audit: Arc<dyn AuditSink>) -> Self {
         Self::with_options(token, ui, audit, BridgeOptions::default())
     }
 
+    /// A single-tab convenience for tests and one-model setups.
     #[must_use]
     pub fn with_options(
         token: impl Into<Arc<str>>,
@@ -298,14 +357,21 @@ impl ServerState {
         audit: Arc<dyn AuditSink>,
         options: BridgeOptions,
     ) -> Self {
-        Self {
-            token: token.into(),
-            relay: Arc::new(Mutex::new(ConversationRelay::new(options.start_fresh))),
-            ui,
+        Self::with_routes(
+            token,
+            vec![RouteGroup {
+                ui,
+                start_fresh: options.start_fresh,
+                models: vec![ModelSpec {
+                    id: "test-model".to_owned(),
+                    owned_by: "test".to_owned(),
+                    name: None,
+                    toggles: Vec::new(),
+                }],
+            }],
             audit,
-            turns: Arc::new(NoopTurns),
             options,
-        }
+        )
     }
 
     /// Attach a sink that records a row per finished turn.
@@ -315,11 +381,25 @@ impl ServerState {
         self
     }
 
+    /// The route serving `model_id`, if the relay serves it.
+    fn route(&self, model_id: &str) -> Option<&ModelRoute> {
+        self.routes
+            .iter()
+            .find(|(id, _)| id == model_id)
+            .map(|(_, route)| route)
+    }
+
+    /// Whether the relay serves `model_id`.
+    #[must_use]
+    pub fn serves_model(&self, model_id: &str) -> bool {
+        self.route(model_id).is_some()
+    }
+
     /// Record a turn, complaining on stderr rather than failing the request when
     /// the log is unwritable.
     async fn record(&self, turn: TurnRecord) {
         if let Err(error) = self.turns.record(turn).await {
-            eprintln!("deepchatcode: could not record the turn: {error}");
+            eprintln!("freechatcode: could not record the turn: {error}");
         }
     }
 
@@ -346,24 +426,24 @@ async fn models(State(state): State<ServerState>, headers: HeaderMap) -> Respons
     if !authorized(&state, &headers) {
         return unauthorized();
     }
-    // Both entries are the same page; `deepseek-pro` is the chat with the page's
-    // reasoning mode engaged. What a model costs is answered here, in the one
-    // place a caller asks, and it is always the same non-empty string.
-    //
-    // Deliberately absent: `context_length` and `max_output`. The page's real
-    // limits are not knowable from the outside, and a made-up number would be a
-    // claim this wrapper cannot support.
+    // The catalog is the configured providers' models. What a model costs is
+    // answered here, in the one place a caller asks, and it is always the same
+    // non-empty string. Deliberately absent: `context_length` and `max_output`
+    // — the page's real limits are not knowable from the outside, and a made-up
+    // number would be a claim this wrapper cannot support.
     let fetched_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
-    let data: Vec<Value> = [MODEL_ID, PRO_MODEL_ID]
-        .into_iter()
-        .map(|id| {
+    let data: Vec<Value> = state
+        .routes
+        .iter()
+        .map(|(id, route)| {
             json!({
                 "id": id,
                 "object": "model",
-                "owned_by": "deepseek-chat-web",
+                "owned_by": route.owned_by,
+                "name": route.name,
                 "pricing": PRICING_LABEL,
                 // Numeric companions, for a caller that only understands a rate.
                 // Zero, because on this route there is no per-token bill.
@@ -390,7 +470,7 @@ async fn completions(
     if !authorized(&state, &headers) {
         return unauthorized();
     }
-    if !serves_model(&request.model) {
+    if state.route(&request.model).is_none() {
         return api_error(StatusCode::BAD_REQUEST, "unknown wrapper model");
     }
     if let Err(message) = validate_request(&request) {
@@ -637,7 +717,10 @@ async fn relay_turn(
     request: &CompletionRequest,
     snapshots: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<Value, (StatusCode, String)> {
-    let mut relay = state.relay.lock().await;
+    let route = state
+        .route(&request.model)
+        .ok_or((StatusCode::BAD_REQUEST, "unknown wrapper model".to_owned()))?;
+    let mut relay = route.relay.lock().await;
     if let Some(assistant) = relay.replay(request) {
         return Ok(assistant);
     }
@@ -667,17 +750,17 @@ async fn relay_turn(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
-    // The model that answers is decided by the page's own reasoning state, so a
-    // pro request is page state, set before the turn starts. A wrapper that
-    // cannot set it fails the turn instead of answering as the wrong model.
-    if let Err(error) = state.ui.set_reasoning(request.model == PRO_MODEL_ID).await {
+    // The model that answers is decided by the page's own state (a reasoning
+    // chip, a dropdown), set before the turn starts. A wrapper that cannot set
+    // it fails the turn instead of answering as the wrong model.
+    if let Err(error) = route.ui.set_model_state(&route.toggles).await {
         state.record_failure(Failure::request(error.clone())).await;
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     let raw = match match snapshots {
-        Some(snapshots) => state.ui.send_streaming(&prompt, reset, snapshots).await,
-        None => state.ui.send(&prompt, reset).await,
+        Some(snapshots) => route.ui.send_streaming(&prompt, reset, snapshots).await,
+        None => route.ui.send(&prompt, reset).await,
     } {
         Ok(raw) => {
             // A reply that is neither a tool call nor a marked final answer is the
@@ -692,7 +775,7 @@ async fn relay_turn(
             } else {
                 let repair = format!("{prompt}\n\n{PROTOCOL_REPAIR}");
                 eprintln!(
-                    "deepchatcode: the reply was neither a tool call nor a marked final \
+                    "freechatcode: the reply was neither a tool call nor a marked final \
                      answer; asking once more instead of ending the turn on it"
                 );
                 let _ = state
@@ -704,7 +787,7 @@ async fn relay_turn(
                         "browser_response": raw.clone(),
                     }))
                     .await;
-                match state.ui.send(&repair, false).await {
+                match route.ui.send(&repair, false).await {
                     Ok(retry) => retry,
                     // The first reply is all there is. Better delivered than lost.
                     Err(_) => raw,
@@ -713,10 +796,10 @@ async fn relay_turn(
         }
         Err(error) => {
             // Never swallow this: the reason a turn died is otherwise invisible.
-            eprintln!("deepchatcode: browser relay failed: {error}");
+            eprintln!("freechatcode: browser relay failed: {error}");
             // Ask the transport what actually happened before blaming anyone: a
             // dead uplink is not the chat service's fault.
-            let failure = match state.ui.diagnose(&error).await {
+            let failure = match route.ui.diagnose(&error).await {
                 Some(failure) => failure,
                 None => Failure::unknown(error.clone()),
             };
@@ -749,8 +832,9 @@ async fn relay_turn(
         .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
     // Which model the page used is not an API fact; record what the UI showed so
     // a conversation can be attributed model-by-model after the fact.
-    let model_label = state.ui.model_label().await;
+    let model_label = route.ui.model_label().await;
     let turn = TurnRecord {
+        provider_id: Some(route.owned_by.clone()),
         model_label: model_label.clone(),
         finish_reason: if assistant.get("tool_calls").is_some() {
             "tool_calls".to_owned()
@@ -1328,6 +1412,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_MODEL: &str = "test-model";
+    const TEST_PRO_MODEL: &str = "test-pro";
+
     fn install_crypto_provider() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -1426,7 +1513,7 @@ mod tests {
     fn accepts_images_for_bridging_and_rejects_invalid_tool_arguments() {
         assert!(
             validate_request(&CompletionRequest {
-                model: MODEL_ID.into(),
+                model: TEST_MODEL.into(),
                 messages: vec![json!({"role":"user","content":[{"type":"image_url"}]})],
                 tools: None,
                 tool_choice: None,
@@ -1486,7 +1573,7 @@ mod tests {
         let tools = vec![json!({"type":"function","function":{"name":"read_file"}})];
 
         let first = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"USER-QUESTION-MARKER"}),
@@ -1509,7 +1596,7 @@ mod tests {
         // Codewhale rewrites the assistant message (adds reasoning_content,
         // normalises content) and appends the tool result.
         let continuation = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"USER-QUESTION-MARKER"}),
@@ -1541,7 +1628,7 @@ mod tests {
 
         // Codewhale resumes with an existing transcript.
         let resumed = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"EARLIER-TURN"}),
@@ -1768,7 +1855,7 @@ mod tests {
         // the user by reciting that paragraph back.
         let relay = ConversationRelay::new(false);
         let request = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"PROJECT-BRIEFING-MARKER"}),
                 json!({"role":"user","content":"USER-MARKER"}),
@@ -2122,7 +2209,7 @@ mod tests {
 
     fn request(messages: Vec<Value>, stream: bool) -> CompletionRequest {
         CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages,
             tools: Some(vec![json!({
                 "type":"function",
@@ -2224,13 +2311,32 @@ mod tests {
     #[tokio::test]
     async fn both_models_are_advertised_with_a_price_that_is_never_unknown() {
         install_crypto_provider();
-        let state = ServerState::new(
+        let ui = Arc::new(FakeUi {
+            replies: StdMutex::new(Vec::new()),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
             "secret",
-            Arc::new(FakeUi {
-                replies: StdMutex::new(Vec::new()),
-                prompts: StdMutex::new(Vec::new()),
-            }),
+            vec![RouteGroup {
+                ui,
+                start_fresh: false,
+                models: vec![
+                    ModelSpec {
+                        id: TEST_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: TEST_PRO_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
             Arc::new(FakeAudit),
+            BridgeOptions::default(),
         );
         let address = serve(state).await;
         let body: Value = reqwest::Client::new()
@@ -2250,11 +2356,11 @@ mod tests {
             .filter_map(|entry| entry["id"].as_str())
             .collect();
         assert!(
-            ids.contains(&MODEL_ID),
+            ids.contains(&TEST_MODEL),
             "the chat model must be advertised: {ids:?}"
         );
         assert!(
-            ids.contains(&PRO_MODEL_ID),
+            ids.contains(&TEST_PRO_MODEL),
             "the pro model must be advertised: {ids:?}"
         );
 
@@ -2273,27 +2379,73 @@ mod tests {
 
     #[test]
     fn only_the_models_this_wrapper_serves_are_accepted() {
-        assert!(serves_model(MODEL_ID));
-        assert!(serves_model(PRO_MODEL_ID));
-        assert!(!serves_model("gpt-5.5"));
-        assert!(!serves_model(""));
+        let ui: Arc<dyn ChatUi> = Arc::new(FakeUi {
+            replies: StdMutex::new(Vec::new()),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
+            "secret",
+            vec![RouteGroup {
+                ui,
+                start_fresh: false,
+                models: vec![
+                    ModelSpec {
+                        id: TEST_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: TEST_PRO_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
+            Arc::new(FakeAudit),
+            BridgeOptions::default(),
+        );
+        assert!(state.serves_model(TEST_MODEL));
+        assert!(state.serves_model(TEST_PRO_MODEL));
+        assert!(!state.serves_model("gpt-5.5"));
+        assert!(!state.serves_model(""));
     }
 
     #[tokio::test]
     async fn the_pro_model_is_served_and_a_stranger_is_still_refused() {
         install_crypto_provider();
-        let state = ServerState::new(
+        let ui = Arc::new(FakeUi {
+            replies: StdMutex::new(vec!["ok".to_owned()]),
+            prompts: StdMutex::new(Vec::new()),
+        });
+        let state = ServerState::with_routes(
             "secret",
-            Arc::new(FakeUi {
-                replies: StdMutex::new(vec!["ok".to_owned()]),
-                prompts: StdMutex::new(Vec::new()),
-            }),
+            vec![RouteGroup {
+                ui,
+                start_fresh: false,
+                models: vec![
+                    ModelSpec {
+                        id: TEST_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                    ModelSpec {
+                        id: TEST_PRO_MODEL.into(),
+                        owned_by: "deepseek".into(),
+                        name: None,
+                        toggles: vec![],
+                    },
+                ],
+            }],
             Arc::new(FakeAudit),
+            BridgeOptions::default(),
         );
         let address = serve(state).await;
 
         let mut pro = request(vec![json!({"role":"user","content":"hi"})], false);
-        pro.model = PRO_MODEL_ID.to_owned();
+        pro.model = TEST_PRO_MODEL.to_owned();
         let response = post(address, "secret", &pro, None).await;
         assert_eq!(
             response.status(),
@@ -2304,12 +2456,86 @@ mod tests {
         // model: the model id is the only thing that tells the caller which one
         // it asked for.
         let body: Value = response.json().await.expect("completion json");
-        assert_eq!(body["model"], PRO_MODEL_ID);
+        assert_eq!(body["model"], TEST_PRO_MODEL);
 
         let mut stranger = request(vec![json!({"role":"user","content":"hi"})], false);
         stranger.model = "gpt-5.5".to_owned();
         let response = post(address, "secret", &stranger, None).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn two_providers_are_advertised_and_served_apart() {
+        install_crypto_provider();
+        let state = ServerState::with_routes(
+            "secret",
+            vec![
+                RouteGroup {
+                    ui: Arc::new(FakeUi {
+                        replies: StdMutex::new(vec!["ok".to_owned()]),
+                        prompts: StdMutex::new(Vec::new()),
+                    }),
+                    start_fresh: false,
+                    models: vec![ModelSpec {
+                        id: "deepseek-chat".into(),
+                        owned_by: "deepseek".into(),
+                        name: Some("DeepSeek Chat".into()),
+                        toggles: vec![],
+                    }],
+                },
+                RouteGroup {
+                    ui: Arc::new(FakeUi {
+                        replies: StdMutex::new(vec!["ok".to_owned()]),
+                        prompts: StdMutex::new(Vec::new()),
+                    }),
+                    start_fresh: false,
+                    models: vec![ModelSpec {
+                        id: "gemini-flash".into(),
+                        owned_by: "gemini".into(),
+                        name: Some("Gemini Flash".into()),
+                        toggles: vec![],
+                    }],
+                },
+            ],
+            Arc::new(FakeAudit),
+            BridgeOptions::default(),
+        );
+        let address = serve(state).await;
+
+        // The catalog lists both providers' models, each owned by its provider.
+        let catalog: Value = reqwest::Client::new()
+            .get(format!("http://{address}/v1/models"))
+            .bearer_auth("secret")
+            .send()
+            .await
+            .expect("models response")
+            .json()
+            .await
+            .expect("models json");
+        let entries = catalog["data"].as_array().expect("a model list");
+        let owned_by = |id: &str| -> String {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .and_then(|entry| entry["owned_by"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+        assert_eq!(owned_by("deepseek-chat"), "deepseek");
+        assert_eq!(owned_by("gemini-flash"), "gemini");
+
+        // Both are served and reported under the model the caller asked for.
+        for model in ["deepseek-chat", "gemini-flash"] {
+            let mut req = request(vec![json!({"role":"user","content":"hi"})], false);
+            req.model = model.to_owned();
+            let response = post(address, "secret", &req, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{model} must be served");
+            let body: Value = response.json().await.expect("completion json");
+            assert_eq!(
+                body["model"], model,
+                "{model} must be reported, not assumed"
+            );
+        }
     }
 
     #[tokio::test]
