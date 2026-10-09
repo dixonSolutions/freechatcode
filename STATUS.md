@@ -3,6 +3,14 @@
 What FreeChatCode can do, what was verified, and what was not. Last updated
 2026-10-08 on the machine described under [Environment](#environment).
 
+> **Architecture note (2026-10-09):** this file is the evidence log for the
+> single-provider (DeepSeek-only) build. The project has since been renamed to
+> `freechatcode` and generalized to multiple providers and harnesses — see
+> [docs/architecture.md](docs/architecture.md) for the target design and
+> [docs/design.md](docs/design.md) for the ownership split. The live evidence
+> below remains valid for the DeepSeek provider, which is now one
+> `[[providers]]` entry rather than the whole project.
+
 The short version: the bridge works end to end. A real `codewhale` 0.10.0
 process was driven through the local relay, the browser, and the live DeepSeek
 Chat page, and printed its answer. Every core criterion below was exercised

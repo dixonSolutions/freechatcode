@@ -1,9 +1,13 @@
 # Architecture v2 — provider-agnostic, harness-agnostic
 
-Status: **proposal, grounded in verification**. This doc defines the target for
-the multi-provider / multi-harness redesign. It builds on, and does not replace,
-[docs/design.md](design.md) — the "who owns what" split there is still the law of
-the project.
+Status: **mostly implemented and verified** — the provider abstraction
+(`[[providers]]` config, config-driven relay catalog, per-model `set_model_state`),
+harness adapters (codewhale + opencode), and the multi-provider launcher (one tab
+per provider, one relay) are landed with tests. Still open: sharing one Chromium
+context across tabs, the `doctor`/`test` setup probe, Gemini's live selector
+verification, and openclaw/hermes adapters. This doc defines the target and
+builds on, without replacing, [docs/design.md](design.md) — the "who owns what"
+split there is still the law of the project.
 
 Why this exists: `freechatcode launch opencode` exited 1. The cause was not a
 browser problem and not a relay problem. The launcher hardcodes the **Codewhale**

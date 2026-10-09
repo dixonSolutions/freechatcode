@@ -4,7 +4,7 @@
 FreeChatCode is a local, OpenAI-compatible bridge: it starts a loopback-only
 relay, drives a real Chromium session through Playwright, and hands a coding
 agent (Codewhale today) a model that answers from a free chat page — DeepSeek
-Chat first, with more providers on the way.
+Chat verified today; Gemini and other chat UIs are one config entry away.
 
 No API key. No per-token bill. Your own signed-in browser session does the work.
 
@@ -103,10 +103,11 @@ what the wrapper does or does not do to a reply.
   control is driven**, not just read: asking the relay for `deepseek-pro`
   engages it, and the next `deepseek-chat` turn puts it back. Verified live — the
   chips read `off → on → on through a real turn → off`.
-- **Two models** — `/v1/models` advertises `deepseek-chat` and `deepseek-pro`,
-  both served by the same page; `--model deepseek-pro` launches Codewhale on the
-  reasoning one. A pro turn that cannot engage DeepThink fails rather than
-  answering as the plain model.
+- **Configured models** — `/v1/models` advertises every model in your
+  `[[providers]]` config (the default DeepSeek provider ships `deepseek-chat` and
+  `deepseek-pro`, both served by one tab); `--model deepseek-pro` launches the
+  harness on the reasoning one. A pro turn that cannot engage DeepThink fails
+  rather than answering as the plain model.
 - **A price that is never "unknown"** — asked what a model costs, the wrapper
   answers `Unlimited Chat!`, always a non-empty string. What *Codewhale's own
   footer* prints is a separate matter; see the note under [Status](#status).
@@ -193,7 +194,7 @@ Driver and browser always match, because both come from the same crate version.
 | `freechatcode turns [--limit N]` | The recorded turn log: which model answered what |
 | `freechatcode install` | Install `codewhale-cli` via cargo |
 
-Useful flags: `--mode show|silent`, `--model deepseek-chat|deepseek-pro`,
+Useful flags: `--mode show|silent`, `--model <model-id>` (any configured model),
 `--chat-url`, `--profile-dir`, `--cdp-endpoint`, `--record-video <DIR>`,
 `--record-video-size WxH` (`--record-video` records the page the wrapper drives —
 never your desktop).
@@ -245,9 +246,9 @@ continues afterwards. `--mode show|silent` overrides the config file.
 mode = "managed"        # "managed" (own profile) or "attach" (your browser, over CDP)
 headless = true         # false = always visible; true reopens a window if sign-in is needed
 keep_alive = true       # false = close the browser after every turn
-# profile_dir = "/home/you/.codewhale/deepseek-chat/browser"
+# profile_dir = "/home/you/.codewhale/providers/deepseek/browser"
 # cdp_endpoint = "http://127.0.0.1:9222"
-# record_video_dir = "/home/you/.codewhale/deepseek-chat/video"
+# record_video_dir = "/home/you/.codewhale/freechatcode/video"
 # record_video_size = "1280x800"
 ```
 
@@ -290,21 +291,47 @@ exactly what `gui` mode drives, so synthesizing it here is deliberately out of
 scope. The mechanism is kept, complete and configurable, for endpoints that need
 no such header.
 
-### Selectors, timeouts, tools
+### Providers
 
-The selectors are configuration because the chat UI can change:
+Each free chat site is a `[[providers]]` entry: its URL, its selectors, and the
+models it serves. A model is page state (a reasoning chip, a dropdown), so two
+models on one provider share one conversation. The shipped defaults define
+DeepSeek; add Gemini (or any other chat UI) as a second entry:
 
 ```toml
-[selectors]
+[[providers]]
+id = "deepseek"
+name = "DeepSeek Chat"
+
+[providers.chat]
+url = "https://chat.deepseek.com"
+allowed_hosts = ["chat.deepseek.com"]
+routed_url_pattern = "/a/chat/s/"
+
+[providers.selectors]
 composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
 assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
 send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
-search_toggle = "div.ds-toggle-button:has-text('Search')"
+new_chat = "button[aria-label*='new chat' i]"
 thinking_toggle = "div.ds-toggle-button:has-text('DeepThink')"
 model_label = "div.ds-toggle-button"   # what `freechatcode turns` records
+
+[[providers.models]]
+id = "deepseek-chat"
+name = "DeepSeek Chat"
+toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = false }]
+
+[[providers.models]]
+id = "deepseek-pro"
+name = "DeepSeek Pro"
+toggles = [{ selector = "div.ds-toggle-button:has-text('DeepThink')", on = true }]
 ```
 
-The two toggles and the model label were read off the live page, not guessed.
+`[[providers.models]]` declares what `/v1/models` advertises; a model's `toggles`
+are the page controls engaged before a turn (and read back after). The selectors
+were read off the live page, not guessed. Every provider runs as its own tab in
+one relay, so `--model gemini-flash` and `--model deepseek-pro` both work in the
+same session.
 
 Timeouts are knobs too, and they matter: `poll_ms` (how often the page is
 re-read) and `settle_polls` (how many identical reads mean "the reply stopped
