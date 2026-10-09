@@ -4,7 +4,7 @@
 //! harness owns the turn loop, tools, permissions, and workspace (see
 //! `docs/design.md`). Each harness has a different spawn contract, so it gets
 //! its own adapter here rather than a shared, hardcoded argv — which is exactly
-//! what made `deepchatcode launch opencode` exit 1 (the launcher passed the
+//! what made `freechatcode launch opencode` exit 1 (the launcher passed the
 //! Codewhale flags to a harness that has none of them).
 
 use std::ffi::OsString;

@@ -35,13 +35,6 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-pub const MODEL_ID: &str = "deepseek-chat";
-
-/// The reasoning model. Same page, same session — it is `deepseek-chat` with the
-/// page's DeepThink mode engaged, which is how the site itself exposes a
-/// stronger model. Nothing hardcoded beyond the name: the toggle is config.
-pub const PRO_MODEL_ID: &str = "deepseek-pro";
-
 /// The one answer to "what does this cost?".
 ///
 /// A string, and not a rate, because the honest answer on this route is not a
@@ -370,7 +363,7 @@ impl ServerState {
                 ui,
                 start_fresh: options.start_fresh,
                 models: vec![ModelSpec {
-                    id: MODEL_ID.to_owned(),
+                    id: "test-model".to_owned(),
                     owned_by: "test".to_owned(),
                     name: None,
                     toggles: Vec::new(),
@@ -1419,6 +1412,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_MODEL: &str = "test-model";
+    const TEST_PRO_MODEL: &str = "test-pro";
+
     fn install_crypto_provider() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -1517,7 +1513,7 @@ mod tests {
     fn accepts_images_for_bridging_and_rejects_invalid_tool_arguments() {
         assert!(
             validate_request(&CompletionRequest {
-                model: MODEL_ID.into(),
+                model: TEST_MODEL.into(),
                 messages: vec![json!({"role":"user","content":[{"type":"image_url"}]})],
                 tools: None,
                 tool_choice: None,
@@ -1577,7 +1573,7 @@ mod tests {
         let tools = vec![json!({"type":"function","function":{"name":"read_file"}})];
 
         let first = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"USER-QUESTION-MARKER"}),
@@ -1600,7 +1596,7 @@ mod tests {
         // Codewhale rewrites the assistant message (adds reasoning_content,
         // normalises content) and appends the tool result.
         let continuation = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"USER-QUESTION-MARKER"}),
@@ -1632,7 +1628,7 @@ mod tests {
 
         // Codewhale resumes with an existing transcript.
         let resumed = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"SYS"}),
                 json!({"role":"user","content":"EARLIER-TURN"}),
@@ -1859,7 +1855,7 @@ mod tests {
         // the user by reciting that paragraph back.
         let relay = ConversationRelay::new(false);
         let request = CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages: vec![
                 json!({"role":"system","content":"PROJECT-BRIEFING-MARKER"}),
                 json!({"role":"user","content":"USER-MARKER"}),
@@ -2213,7 +2209,7 @@ mod tests {
 
     fn request(messages: Vec<Value>, stream: bool) -> CompletionRequest {
         CompletionRequest {
-            model: MODEL_ID.into(),
+            model: TEST_MODEL.into(),
             messages,
             tools: Some(vec![json!({
                 "type":"function",
@@ -2326,13 +2322,13 @@ mod tests {
                 start_fresh: false,
                 models: vec![
                     ModelSpec {
-                        id: MODEL_ID.into(),
+                        id: TEST_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
                     },
                     ModelSpec {
-                        id: PRO_MODEL_ID.into(),
+                        id: TEST_PRO_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
@@ -2360,11 +2356,11 @@ mod tests {
             .filter_map(|entry| entry["id"].as_str())
             .collect();
         assert!(
-            ids.contains(&MODEL_ID),
+            ids.contains(&TEST_MODEL),
             "the chat model must be advertised: {ids:?}"
         );
         assert!(
-            ids.contains(&PRO_MODEL_ID),
+            ids.contains(&TEST_PRO_MODEL),
             "the pro model must be advertised: {ids:?}"
         );
 
@@ -2394,13 +2390,13 @@ mod tests {
                 start_fresh: false,
                 models: vec![
                     ModelSpec {
-                        id: MODEL_ID.into(),
+                        id: TEST_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
                     },
                     ModelSpec {
-                        id: PRO_MODEL_ID.into(),
+                        id: TEST_PRO_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
@@ -2410,8 +2406,8 @@ mod tests {
             Arc::new(FakeAudit),
             BridgeOptions::default(),
         );
-        assert!(state.serves_model(MODEL_ID));
-        assert!(state.serves_model(PRO_MODEL_ID));
+        assert!(state.serves_model(TEST_MODEL));
+        assert!(state.serves_model(TEST_PRO_MODEL));
         assert!(!state.serves_model("gpt-5.5"));
         assert!(!state.serves_model(""));
     }
@@ -2430,13 +2426,13 @@ mod tests {
                 start_fresh: false,
                 models: vec![
                     ModelSpec {
-                        id: MODEL_ID.into(),
+                        id: TEST_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
                     },
                     ModelSpec {
-                        id: PRO_MODEL_ID.into(),
+                        id: TEST_PRO_MODEL.into(),
                         owned_by: "deepseek".into(),
                         name: None,
                         toggles: vec![],
@@ -2449,7 +2445,7 @@ mod tests {
         let address = serve(state).await;
 
         let mut pro = request(vec![json!({"role":"user","content":"hi"})], false);
-        pro.model = PRO_MODEL_ID.to_owned();
+        pro.model = TEST_PRO_MODEL.to_owned();
         let response = post(address, "secret", &pro, None).await;
         assert_eq!(
             response.status(),
@@ -2460,7 +2456,7 @@ mod tests {
         // model: the model id is the only thing that tells the caller which one
         // it asked for.
         let body: Value = response.json().await.expect("completion json");
-        assert_eq!(body["model"], PRO_MODEL_ID);
+        assert_eq!(body["model"], TEST_PRO_MODEL);
 
         let mut stranger = request(vec![json!({"role":"user","content":"hi"})], false);
         stranger.model = "gpt-5.5".to_owned();

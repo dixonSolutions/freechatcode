@@ -1019,9 +1019,11 @@ mod tests {
     use super::browser::*;
     use super::*;
     use freechatcode::config::{BrowserMode, Selectors, Toggle};
-    use freechatcode::{MODEL_ID, PRO_MODEL_ID};
     use playwright_rs::Playwright;
     use playwright_rs::protocol::{BrowserContextOptions, Page};
+
+    const TEST_MODEL_ID: &str = "deepseek-chat";
+    const TEST_PRO_MODEL_ID: &str = "deepseek-pro";
 
     #[test]
     fn chat_url_acceptance_follows_config() {
@@ -1494,7 +1496,7 @@ mod tests {
             .post(&url)
             .bearer_auth("live-token")
             .json(&json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": ask}],
                 "tools": tools,
             }))
@@ -1522,7 +1524,7 @@ mod tests {
             .post(&url)
             .bearer_auth("live-token")
             .json(&json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [
                     {"role": "user", "content": ask},
                     {"role": "assistant", "content": null, "tool_calls": message["tool_calls"]},
@@ -1880,7 +1882,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": PRO_MODEL_ID,
+                "model": TEST_PRO_MODEL_ID,
                 "messages": [{"role": "user", "content": "Reply with exactly the word ELEVEN and nothing else."}],
                 "stream": false,
             }))
@@ -1910,7 +1912,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": "Reply with exactly the word TWELVE and nothing else."}],
                 "stream": false,
             }))
@@ -1981,7 +1983,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{"role": "user", "content": "Write exactly three short sentences about the ocean. Nothing else."}],
                 "stream": true,
             }))
@@ -2259,7 +2261,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [
                     {"role": "system", "content": "BRIEFING-MARKER: the project rules and the tool catalog live here."},
                     {"role": "user", "content": "You can call tools you know"},
@@ -2358,7 +2360,7 @@ mod tests {
             .post(format!("http://{address}/v1/chat/completions"))
             .bearer_auth("secret")
             .json(&serde_json::json!({
-                "model": MODEL_ID,
+                "model": TEST_MODEL_ID,
                 "messages": [{
                     "role": "user",
                     "content": "Hello, I want to discuss the name of this project, a better one, and also adding support for Gemini app, and google ai mode, research, run terminal commands, read files, read docs",
@@ -3091,14 +3093,14 @@ mod tests {
 
     /// Diagnostic: open a page and print what it actually shows. When a turn
     /// goes silent, "what is the page displaying?" is the question that matters.
-    /// Set `DEEPCHATCODE_INSPECT_URL` to the conversation (defaults to the chat
+    /// Set `FREECHATCODE_INSPECT_URL` to the conversation (defaults to the chat
     /// URL). Runs on a copy of the profile, so it never disturbs a live session.
     #[tokio::test]
     #[ignore = "diagnostic: inspects a live page; needs a signed-in profile"]
     async fn live_inspect_page() {
         let home = default_home().expect("codewhale home");
         let config = Config::load(Some(&config::user_config_path(&home))).expect("config");
-        let url = std::env::var("DEEPCHATCODE_INSPECT_URL")
+        let url = std::env::var("FREECHATCODE_INSPECT_URL")
             .unwrap_or_else(|_| config.providers[0].chat.url.clone());
         let (_dir, profile) = profile_copy();
 
@@ -3343,13 +3345,13 @@ mod tests {
         // A visible window so a signed-out profile can be signed in by hand.
         config.browser.headless = false;
         // Optional recording, so a demo clip can be produced from a real turn.
-        if let Ok(dir) = std::env::var("DEEPCHATCODE_RECORD_VIDEO_DIR") {
+        if let Ok(dir) = std::env::var("FREECHATCODE_RECORD_VIDEO_DIR") {
             config.browser.record_video_dir = Some(dir);
         }
-        if let Ok(size) = std::env::var("DEEPCHATCODE_RECORD_VIDEO_SIZE") {
+        if let Ok(size) = std::env::var("FREECHATCODE_RECORD_VIDEO_SIZE") {
             config.browser.record_video_size = Some(size);
         }
-        let prompt = std::env::var("DEEPCHATCODE_DEMO_PROMPT")
+        let prompt = std::env::var("FREECHATCODE_DEMO_PROMPT")
             .unwrap_or_else(|_| "Reply with exactly the word PONG and nothing else.".to_owned());
         let workspace = std::env::current_dir().expect("cwd");
         let sessions_dir = home.join("sessions");
