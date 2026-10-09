@@ -468,6 +468,106 @@ fn take_terminal_off_stdin() -> Option<std::fs::File> {
     }
 }
 
+/// Where the wrapper's own diagnostics go once the harness owns the screen.
+fn wrapper_log_path(home: &Path) -> PathBuf {
+    home.join("freechatcode").join("freechatcode.log")
+}
+
+/// Take the wrapper's own voice off the screen the moment the harness owns it,
+/// and give it back when the harness is done.
+///
+/// The bridge hands the terminal to the harness at 0.00s and keeps writing to
+/// its own stdout and stderr: `browser ready in 5.5s` as the page warms,
+/// `reply settled after 20 polls` at the end of every turn, and the browser's
+/// own notes in between. While the harness renders an alternate-screen TUI
+/// there is no cursor to share, so each of those lines is painted wherever the
+/// TUI last drew — which is the prompt box the user is typing into. The report
+/// was exactly that: a screenshot of `freechatcode: reply settled after 20
+/// polls (…)` sitting in Codewhale's prompt box.
+///
+/// The harness already holds the terminal by the time this runs — its stdio was
+/// duplicated at `spawn()` — so repointing the wrapper's own fd 1 and fd 2
+/// cannot reach it. From here the wrapper's diagnostics go to a log file and
+/// the screen belongs to the harness alone. When the harness exits, the saved
+/// descriptors are put back so the wrapper can still report a failed run.
+struct ScreenHandover {
+    log: PathBuf,
+    saved: Vec<(i32, std::fs::File)>,
+}
+
+impl ScreenHandover {
+    /// Redirect whatever the wrapper writes to a terminal into `log`. Returns
+    /// `None` when neither stdout nor stderr is a terminal: nothing is sharing
+    /// a screen, and a script that captured those streams still wants the lines
+    /// where it put them.
+    fn take(log: PathBuf) -> Option<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut targets = Vec::new();
+        if std::io::stdout().is_terminal() {
+            targets.push(1);
+        }
+        if std::io::stderr().is_terminal() {
+            targets.push(2);
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Owner-only: the log carries the same URLs and diagnostics the audit
+        // log does.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log)
+            .ok()?;
+        let mut saved = Vec::new();
+        for fd in targets {
+            // SAFETY: dup(2)/dup2(2) on the wrapper's own descriptors. `copy`
+            // is a fresh duplicate taken before the original is repointed, and
+            // it is closed again in `put_back`.
+            unsafe {
+                let copy = libc::dup(fd);
+                if copy < 0 {
+                    continue;
+                }
+                if libc::dup2(file.as_raw_fd(), fd) < 0 {
+                    libc::close(copy);
+                    continue;
+                }
+                saved.push((fd, std::fs::File::from_raw_fd(copy)));
+            }
+        }
+        if saved.is_empty() {
+            return None;
+        }
+        Some(Self { log, saved })
+    }
+
+    /// Put the wrapper's own stdout/stderr back on the terminal. Idempotent, so
+    /// an explicit call and the `Drop` backstop cannot fight.
+    fn put_back(&mut self) {
+        use std::os::fd::AsRawFd;
+        for (fd, saved) in self.saved.drain(..) {
+            // SAFETY: restoring the descriptor this struct saved from the same
+            // fd, which nothing else repointed in between.
+            unsafe {
+                libc::dup2(saved.as_raw_fd(), fd);
+            }
+        }
+    }
+}
+
+impl Drop for ScreenHandover {
+    fn drop(&mut self) {
+        self.put_back();
+    }
+}
+
 /// One-time move of the first release's DeepSeek profile/audit directory into
 /// the per-provider layout, so a signed-in browser session is not lost.
 fn migrate_provider_dirs(home: &Path) {
@@ -931,6 +1031,17 @@ async fn run() -> Result<()> {
         println!("[browser] keep_alive = false: the browser closes after every turn.");
     }
 
+    // The harness is about to own the terminal, and from the next line on the
+    // user will not see the wrapper's own diagnostics on it. Say where they
+    // will be. See `ScreenHandover`.
+    let log_path = wrapper_log_path(&home);
+    if std::io::stdout().is_terminal() {
+        println!(
+            "freechatcode: the screen goes to the harness; this run's logs: {}",
+            log_path.display()
+        );
+    }
+
     // The harness still gets the terminal on stdin; the wrapper just no longer
     // holds it itself.
     let child_stdin = match terminal {
@@ -959,6 +1070,9 @@ async fn run() -> Result<()> {
                 harness_kind, codewhale_bin
             )
         })?;
+    // The harness's stdio was duplicated above, so it keeps the terminal. The
+    // wrapper gives up its own now, so nothing it writes can land on the TUI.
+    let mut handover = ScreenHandover::take(log_path.clone());
     let harness_name = match harness_kind {
         HarnessKind::Codewhale => "Codewhale",
         HarnessKind::Opencode => "opencode",
@@ -999,6 +1113,16 @@ async fn run() -> Result<()> {
     server.abort();
     for browser in &browsers {
         browser.shutdown().await;
+    }
+    // The harness has released the screen. Put the wrapper's own streams back
+    // so its last words — including a failed-exit report — land on the
+    // terminal, not in the log file.
+    if let Some(handover) = handover.as_mut() {
+        handover.put_back();
+        println!(
+            "freechatcode: the harness exited; this run's logs are in {}",
+            handover.log.display()
+        );
     }
     if !status.success() {
         bail!("Codewhale exited with {status}");
@@ -3494,12 +3618,13 @@ mod tests {
     /// explicitly, so the guard has nothing to snapshot and nothing to write
     /// back.
     ///
-    /// This runs the shipped wrapper on a real pty with no Codewhale arguments,
-    /// so Codewhale runs its interactive TUI, and asserts what the user is left
-    /// with once the browser is warm: `ECHO` still clear across consecutive
+    /// This runs the shipped wrapper on a real pty with no harness arguments,
+    /// so the harness runs its interactive TUI, and asserts what the user is
+    /// left with once the browser is warm: `ECHO` still clear across consecutive
     /// samples, the wrapper's own fd 0 not a terminal while the child it spawned
-    /// holds this terminal on fd 0, and a mouse report written to the master not
-    /// coming back as text.
+    /// holds this terminal on fd 0, a mouse report written to the master not
+    /// coming back as text, and — issue #4 — no wrapper diagnostic reaching the
+    /// screen after the wrapper hands it over (they go to its log file instead).
     #[tokio::test]
     #[ignore = "needs a signed-in profile, the network, and a built binary"]
     async fn live_the_wrapper_keeps_the_terminal_raw_for_the_tui() {
@@ -3525,6 +3650,35 @@ mod tests {
         fn tail(output: &[u8]) -> String {
             let start = output.len().saturating_sub(1200);
             String::from_utf8_lossy(&output[start..]).into_owned()
+        }
+
+        /// The byte offset of the last `needle` in `haystack`.
+        fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            if needle.is_empty() || haystack.len() < needle.len() {
+                return None;
+            }
+            (0..=haystack.len() - needle.len())
+                .rev()
+                .find(|&at| &haystack[at..at + needle.len()] == needle)
+        }
+
+        /// The byte offset of the first `needle` in `haystack`.
+        fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            if needle.is_empty() {
+                return None;
+            }
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        }
+
+        /// The wrapper's log path, read from the handover notice it prints on
+        /// the terminal just before it gives the screen to the harness.
+        fn log_path_of(output: &[u8]) -> Option<String> {
+            let text = String::from_utf8_lossy(output);
+            let (_, rest) = text.rsplit_once("this run's logs: ")?;
+            let path = rest.lines().next()?.trim();
+            (!path.is_empty()).then(|| path.to_owned())
         }
 
         /// What `/proc/<pid>/fd/0` points at, and whether that is a terminal.
@@ -3708,6 +3862,16 @@ mod tests {
         let pty = Pty::open();
         eprintln!("[tty] running {} on {}", cli.display(), pty.slave);
 
+        // Once the harness owns the screen the wrapper's own diagnostics go to
+        // this file instead of the terminal (see `ScreenHandover`), so the
+        // warm-up line is read from here. Snapshot its length first: the log is
+        // appended to across runs, and a previous run's line must not satisfy
+        // the check.
+        let expected_log = wrapper_log_path(&default_home().expect("codewhale home"));
+        let logged_before = std::fs::metadata(&expected_log)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
         let slave = std::fs::File::options()
             .read(true)
             .write(true)
@@ -3765,14 +3929,46 @@ mod tests {
         // The guard is only in play once a browser was launched, and the TUI is
         // what needs the terminal: without these, a pass would say nothing.
         assert!(
-            holds(&output, b"browser ready in"),
-            "the browser must be warm for this to be about the guard; output: {}",
-            tail(&output)
-        );
-        assert!(
             holds(&output, b"\x1b[?1006h"),
             "Codewhale must be in its interactive TUI (no mouse tracking seen); output: {}",
             tail(&output)
+        );
+
+        // Issue #4: the wrapper must stop painting on the screen the moment the
+        // harness owns it. Everything after its handover notice belongs to the
+        // harness; one wrapper line there is the bug the user screenshotted.
+        let notice = b"the screen goes to the harness";
+        let at = rfind(&output, notice).expect("the wrapper must announce the screen handover");
+        assert_eq!(
+            log_path_of(&output).as_deref().map(Path::new),
+            Some(expected_log.as_path()),
+            "the handover notice must name the log file this run writes to"
+        );
+        let after = &output[at + notice.len()..];
+        // The prefix every wrapper diagnostic carries. The harness's own TUI
+        // also prints its cwd, and that path happens to contain
+        // `freechatcode` — so require the colon and space the wrapper writes,
+        // not the bare name.
+        const WRAPPER_LINE: &[u8] = b"freechatcode: ";
+        if let Some(leak) = find(after, WRAPPER_LINE) {
+            let from = leak.saturating_sub(80);
+            let to = (leak + 240).min(after.len());
+            panic!(
+                "the wrapper must not write to the screen once the harness owns it (#4); \
+                 it still wrote: {}",
+                String::from_utf8_lossy(&after[from..to])
+            );
+        }
+
+        // And the line it stopped printing on the screen must still exist: the
+        // warm-up is recorded in the log file instead.
+        let logged = std::fs::read(&expected_log).unwrap_or_default();
+        let fresh = &logged[(logged_before as usize).min(logged.len())..];
+        assert!(
+            holds(fresh, b"browser ready in"),
+            "the warm-up must be recorded in {} once the screen is handed over; it held: {}",
+            expected_log.display(),
+            tail(fresh)
         );
 
         // One lucky sample is not evidence: eight consecutive clear samples over

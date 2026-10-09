@@ -812,3 +812,19 @@ wrong password   -> exit 134, ERRCONNECT_LOGON_FAILURE [0x00020014],
 - Three live tests used the *real* browser profile, so they hung in the sign-in
   wait whenever a session held it (one did exactly that here). They now run on a
   copy, which makes them repeatable and unable to disturb a session in use.
+- **The wrapper's own logs were painted over the harness TUI (issue #4).** The
+  bridge hands the terminal to the harness at 0.00s and then keeps writing to its
+  stdout and stderr — `browser ready in Ns`, `reply settled after N polls` once a
+  turn ends. With an alternate-screen TUI up there is no cursor to share, so those
+  lines landed wherever the TUI last drew, which is the prompt box: the report was
+  a screenshot of `freechatcode: reply settled after 20 polls (…)` sitting in it.
+  The child already holds the terminal — its stdio was duplicated at `spawn()` — so
+  the wrapper now repoints its *own* fd 1 and fd 2 at
+  `~/.codewhale/freechatcode/freechatcode.log` (owner-only) once the screen is
+  handed over, and puts them back when the harness exits so a failed run is still
+  reported on the terminal. When stdout is not a terminal nothing is redirected, so
+  a script that captured those streams is unaffected. Verified by A/B on the pty
+  regression test: with the redirect disabled the test fails naming the leak
+  (`freechatcode: opencode started at 0.00s`); with it in place the wrapper writes
+  nothing to the pty after the handover, the warm-up line is found in the log file,
+  and `ECHO` stays clear across eight samples.

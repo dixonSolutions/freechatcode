@@ -204,6 +204,20 @@ is looked up on `PATH`, a path is used directly), writes the resolved path to
 your user config, and then starts the bridge. A binary pinned with
 `--codewhale-bin` / `$CODEWHALE_BINARY` is not rewritten into the config.
 
+### Where the wrapper's own logs go
+
+The bridge hands the terminal to the harness at 0.00s and keeps writing its own
+diagnostics — `browser ready in 1.8s` as the page warms, `reply settled after N
+polls` at the end of every turn, the browser's notes in between. Once the
+harness' TUI owns the alternate screen there is no cursor to share, so those
+lines land wherever the TUI last drew. They are therefore written to
+`~/.codewhale/freechatcode/freechatcode.log` (owner-only) from the moment the
+screen is handed over, and the screen belongs to the harness alone.
+
+The wrapper prints the path on the way in and again when the harness exits. When
+stdout is not a terminal, nothing is sharing a screen and the lines stay on
+`stderr` as before, so a script that captured them is unaffected.
+
 ## Configuration
 
 Two layers, merged lowest-precedence first:
