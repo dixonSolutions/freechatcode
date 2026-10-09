@@ -11,11 +11,15 @@
 # Same as `--codewhale-bin` / `$CODEWHALE_BINARY`, which take precedence.
 [codewhale]
 binary = "/home/you/.cargo/bin/codewhale"
-# Instruction text handed to the chat model. Point it at an .md/.txt file; the
-# `{project_dir}` placeholder is filled from the working directory and
-# `{payload}` marks where the Codewhale request JSON goes. When unset, the
-# committed assets/system-prompt.md embedded in the binary is used.
-# system_prompt = "/home/you/.config/freechatcode/system-prompt.md"
+
+# A provider can be overridden wholesale — for example to name the page's own
+# reasoning block, which is then excluded from every read of the reply (never the
+# answer, never streamed). DeepSeek's is already set in the committed defaults:
+#
+#   [[providers]]
+#   id = "deepseek"
+#   [providers.selectors]
+#   reasoning = ".ds-think-content"
 
 # Browser settings. All of these are machine-specific.
 [browser]
@@ -84,10 +88,6 @@ binary = "/home/you/.cargo/bin/codewhale"
 [relay]
 # Show a desktop toast when the wrapper has to realign the browser.
 # desktop_notifications = true
-# Forward Codewhale's own system message (the project briefing) into the chat.
-# Off by default: the instruction file identifies the session instead, which
-# keeps the prompt small.
-# forward_system_prompt = true   # default: Codewhale's project briefing reaches the model
 
 [timeouts]
 # login_wait_secs = 900

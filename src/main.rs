@@ -22,8 +22,8 @@ use freechatcode::health;
 use freechatcode::sessions::{self, SessionLinks, TurnRow};
 use freechatcode::setup;
 use freechatcode::{
-    AuditSink, BridgeOptions, ChatUi, DEFAULT_SYSTEM_PROMPT, Failure, ModelSpec, RouteGroup,
-    ServerState, ToolPolicy, TurnRecord, TurnSink, router,
+    AuditSink, BridgeOptions, ChatUi, Failure, ModelSpec, RouteGroup, ServerState, ToolPolicy,
+    TurnRecord, TurnSink, router,
 };
 
 mod browser;
@@ -44,7 +44,7 @@ struct Args {
     #[arg(long)]
     cdp_endpoint: Option<String>,
 
-    /// DeepSeek Chat page to open (defaults to the configured chat URL).
+    /// Chat page to open (defaults to the configured chat URL).
     #[arg(long)]
     chat_url: Option<String>,
 
@@ -77,20 +77,20 @@ struct Args {
     #[arg(long, value_enum)]
     mode: Option<RunMode>,
 
-    /// Model to launch Codewhale with. Defaults to the chat model.
+    /// Model to launch the harness with. Defaults to the chat model.
     #[arg(long)]
     model: Option<String>,
 
-    /// Arguments passed unchanged to Codewhale after `--`.
-    #[arg(last = true)]
+    /// Arguments passed unchanged to the harness after `--`.
+    #[arg(last = true, value_name = "HARNESS_ARGS")]
     codewhale_args: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Check health of codewhale binary, relay, and browser.
+    /// Check the harness binary, the relay, and the browser.
     Health,
-    /// Install codewhale-cli via cargo.
+    /// Install the Codewhale CLI (the default harness) via cargo.
     Install,
     /// Show the pre-flight TUI, then run the bridge.
     Tui,
@@ -106,12 +106,12 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// Find (and remember) the codewhale binary, then run the bridge.
+    /// Find (and remember) the harness binary, then run the bridge.
     Launch {
-        /// Optional codewhale executable name or path to track down.
+        /// Optional harness executable name or path to track down.
         binary: Option<String>,
-        /// Arguments passed unchanged to Codewhale after `--`.
-        #[arg(last = true)]
+        /// Arguments passed unchanged to the harness after `--`.
+        #[arg(last = true, value_name = "HARNESS_ARGS")]
         codewhale_args: Vec<OsString>,
     },
 }
@@ -570,10 +570,18 @@ impl Drop for ScreenHandover {
 
 /// One-time move of the first release's DeepSeek profile/audit directory into
 /// the per-provider layout, so a signed-in browser session is not lost.
+///
+/// This must run before *any* subcommand that can touch a provider directory.
+/// A subcommand that created `providers/<id>/` first made the migration skip
+/// itself, which stranded the only signed-in browser profile under the legacy
+/// name and left the wrapper looking logged out.
 fn migrate_provider_dirs(home: &Path) {
     let legacy = home.join("deepseek-chat");
     let current = home.join("providers").join("deepseek");
-    if legacy.exists() && !current.exists() {
+    if !legacy.exists() {
+        return;
+    }
+    if !current.exists() {
         if let Some(parent) = current.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -584,7 +592,27 @@ fn migrate_provider_dirs(home: &Path) {
                 current.display()
             );
         }
+        return;
     }
+    // The destination already exists. Move each piece it does not have instead
+    // of skipping the whole directory, so an early-created (empty) provider dir
+    // cannot strand a signed-in profile or its audit history.
+    for name in ["browser", "audit"] {
+        let (from, to) = (legacy.join(name), current.join(name));
+        if from.exists()
+            && !to.exists()
+            && let Err(error) = std::fs::rename(&from, &to)
+        {
+            eprintln!(
+                "freechatcode: could not migrate {} to {}: {error}",
+                from.display(),
+                to.display()
+            );
+        }
+    }
+    // `remove_dir` only succeeds once the legacy directory is empty, so this
+    // never discards anything the loop above could not move.
+    let _ = std::fs::remove_dir(&legacy);
 }
 
 /// Check each configured (or the one named) provider: can a browser open, and is
@@ -677,6 +705,10 @@ async fn set_private_file(path: &Path) -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    // Resolve the home and run the one-time directory migration *before* any
+    // subcommand can create a provider directory of its own.
+    let home = default_home()?;
+    migrate_provider_dirs(&home);
 
     let (binary_hint, codewhale_args) = match args.command {
         Some(Commands::Health) => {
@@ -693,11 +725,10 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Turns { limit }) => {
-            print_turns(&default_home()?, limit)?;
+            print_turns(&home, limit)?;
             return Ok(());
         }
         Some(Commands::Doctor { provider }) => {
-            let home = default_home()?;
             let config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
                 .map_err(|error| anyhow::anyhow!(error))?;
             run_doctor(&config, &home, provider.as_deref()).await?;
@@ -714,8 +745,6 @@ async fn run() -> Result<()> {
         None => (None, args.codewhale_args.clone()),
     };
 
-    let home = default_home()?;
-    migrate_provider_dirs(&home);
     let config_path = config::user_config_path(&home);
     let mut config = Config::load_with_mode(Some(&config_path), args.mode)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -800,7 +829,6 @@ async fn run() -> Result<()> {
 
     // Resolve the Codewhale session this run will use (shared across providers).
     let workspace = std::env::current_dir().context("resolve the working directory")?;
-    let project_dir = workspace.to_string_lossy().into_owned();
     let sessions_dir = home.join("sessions");
     let links = Arc::new(
         SessionLinks::open(&home.join("freechatcode").join("sessions.db"))
@@ -975,15 +1003,8 @@ async fn run() -> Result<()> {
         search: config.tools.search.clone(),
         allow_extra: config.tools.allow_extra.clone(),
     };
-    // The instruction text is never hardcoded: read the path from config, else
-    // use the committed default embedded in the binary. `{project_dir}` is filled
-    // here; `{payload}` is filled per request by the relay.
-    let template: String = match config.codewhale.system_prompt.as_deref() {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("read the configured system prompt at {path}"))?,
-        None => DEFAULT_SYSTEM_PROMPT.to_owned(),
-    };
-    let system_prompt: Arc<str> = Arc::from(template.replace("{project_dir}", &project_dir));
+    // The harness's own messages are the prompt: the wrapper writes none of its
+    // own, so there is no template to read and no `{project_dir}` to fill.
     let app = router(
         ServerState::with_routes(
             token.clone(),
@@ -994,8 +1015,6 @@ async fn run() -> Result<()> {
                 // Per-tab freshness lives on each RouteGroup; this field only
                 // drives the single-tab convenience constructor.
                 start_fresh: false,
-                system_prompt,
-                forward_system_prompt: config.relay.forward_system_prompt,
             },
         )
         .with_turns(turns),
@@ -1146,6 +1165,34 @@ mod tests {
     use playwright_rs::Playwright;
     use playwright_rs::protocol::{BrowserContextOptions, Page};
 
+    fn live_state(
+        token: &str,
+        ui: Arc<dyn ChatUi>,
+        audit: Arc<dyn AuditSink>,
+        options: BridgeOptions,
+    ) -> ServerState {
+        let provider = Config::defaults().providers.remove(0);
+        ServerState::with_routes(
+            token.to_owned(),
+            vec![RouteGroup {
+                ui,
+                start_fresh: options.start_fresh,
+                models: provider
+                    .models
+                    .into_iter()
+                    .map(|model| ModelSpec {
+                        id: model.id,
+                        owned_by: provider.id.clone(),
+                        name: model.name,
+                        toggles: model.toggles,
+                    })
+                    .collect(),
+            }],
+            audit,
+            options,
+        )
+    }
+
     const TEST_MODEL_ID: &str = "deepseek-chat";
     const TEST_PRO_MODEL_ID: &str = "deepseek-pro";
 
@@ -1206,12 +1253,101 @@ mod tests {
         assert!(!reply_arrived(2, "previous", 3, "   "));
     }
 
+    /// The managed browser profile the runtime would use for the shipped
+    /// provider, derived through `make_browser` rather than written out — so a
+    /// test cannot point at a directory the wrapper stopped using.
+    fn provider_profile(home: &Path) -> PathBuf {
+        let config = Config::load(Some(&config::user_config_path(home))).expect("config");
+        let provider = config.providers.first().expect("a configured provider");
+        make_browser(
+            &config,
+            provider,
+            home,
+            None,
+            None,
+            provider.chat.url.clone(),
+        )
+        .spec
+        .profile
+    }
+
     #[test]
-    fn wrapper_never_defaults_to_the_users_normal_chrome_profile() {
-        let default = default_home()
-            .expect("Codewhale home")
-            .join("deepseek-chat/browser");
-        assert!(default.ends_with("deepseek-chat/browser"));
+    fn the_managed_profile_belongs_to_the_provider_under_the_codewhale_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let profile = provider_profile(home.path());
+
+        assert_eq!(
+            profile,
+            home.path()
+                .join("providers")
+                .join("deepseek")
+                .join("browser"),
+            "the profile lives under the provider, in the Codewhale home"
+        );
+        assert!(
+            profile.starts_with(home.path()),
+            "the managed browser is never the user's everyday Chromium profile"
+        );
+    }
+
+    #[test]
+    fn migration_still_runs_when_the_provider_directory_already_exists() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path();
+        // The first release kept the signed-in profile and its audit log under
+        // `deepseek-chat/`.
+        let legacy = home.join("deepseek-chat");
+        std::fs::create_dir_all(legacy.join("browser").join("Default")).expect("legacy profile");
+        std::fs::write(
+            legacy.join("browser").join("Default").join("Cookies"),
+            b"signed-in",
+        )
+        .expect("write cookie");
+        std::fs::create_dir_all(legacy.join("audit")).expect("legacy audit");
+        // A subcommand created the per-provider directory first, and left it
+        // empty. This is what used to make the migration skip itself and strand
+        // the only signed-in profile under the legacy name.
+        std::fs::create_dir_all(home.join("providers").join("deepseek")).expect("provider dir");
+
+        migrate_provider_dirs(home);
+
+        let current = home.join("providers").join("deepseek");
+        assert!(
+            current
+                .join("browser")
+                .join("Default")
+                .join("Cookies")
+                .exists(),
+            "a signed-in profile must not be stranded in the legacy directory"
+        );
+        assert!(
+            current.join("audit").exists(),
+            "the audit history moves too"
+        );
+        assert!(!legacy.exists(), "the emptied legacy directory is removed");
+    }
+
+    #[test]
+    fn migration_never_clobbers_a_profile_already_in_the_new_layout() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path();
+        let legacy = home.join("deepseek-chat").join("browser");
+        std::fs::create_dir_all(&legacy).expect("legacy profile");
+        std::fs::write(legacy.join("legacy-cookie"), b"old").expect("write");
+        let current = home.join("providers").join("deepseek").join("browser");
+        std::fs::create_dir_all(&current).expect("current profile");
+        std::fs::write(current.join("current-cookie"), b"new").expect("write");
+
+        migrate_provider_dirs(home);
+
+        assert!(
+            current.join("current-cookie").exists(),
+            "the profile in the new layout is left alone"
+        );
+        assert!(
+            legacy.join("legacy-cookie").exists(),
+            "and the other one is left in place, never deleted"
+        );
     }
 
     #[test]
@@ -1228,6 +1364,33 @@ mod tests {
         assert!(selectors.assistant.contains("ds-markdown"));
         assert!(selectors.send.contains("send"));
         assert!(selectors.new_chat.contains("new-chat"));
+        // Verified against DeepSeek's own stylesheet, which styles the reasoning
+        // as `.ds-think-content .ds-markdown` — i.e. the reasoning *is* a
+        // markdown block, and would be caught by `assistant` without this.
+        assert_eq!(selectors.reasoning, ".ds-think-content");
+    }
+
+    #[test]
+    fn the_pages_reasoning_is_excluded_from_every_alternative_of_the_reply_selector() {
+        let selectors = Config::defaults().providers[0].selectors.clone();
+        let selector = browser::reply_selector(&selectors);
+        let alternatives: Vec<&str> = selector.split(',').map(str::trim).collect();
+        assert_eq!(
+            alternatives.len(),
+            selectors.assistant.split(',').count(),
+            "one alternative in, one out: {selector}"
+        );
+        for alternative in &alternatives {
+            assert!(
+                alternative.ends_with(":not(.ds-think-content):not(.ds-think-content *)"),
+                "every alternative must exclude the reasoning block and its contents: {alternative}"
+            );
+        }
+
+        // A provider that renders no reasoning gets its selector back untouched.
+        let mut plain = selectors.clone();
+        plain.reasoning = String::new();
+        assert_eq!(browser::reply_selector(&plain), selectors.assistant);
     }
 
     #[test]
@@ -1552,7 +1715,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -1567,18 +1730,13 @@ mod tests {
         });
         ui.ensure_open().await.expect("open the browser");
 
-        let state = ServerState::with_options(
+        let state = live_state(
             "live-token",
             ui.clone(),
             Arc::new(QuietAudit),
             BridgeOptions {
                 tools: ToolPolicy::default(),
                 start_fresh: true,
-                system_prompt: Arc::from(
-                    DEFAULT_SYSTEM_PROMPT
-                        .replace("{project_dir}", workspace.to_string_lossy().as_ref()),
-                ),
-                forward_system_prompt: false,
             },
         )
         // Record into the real turn log, so `freechatcode turns` can be checked
@@ -1692,7 +1850,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -1993,7 +2151,7 @@ mod tests {
         let audit = JsonlAudit::create(&dir.path().join("audit"))
             .await
             .expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2094,7 +2252,7 @@ mod tests {
         let audit = JsonlAudit::create(&dir.path().join("audit"))
             .await
             .expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2330,15 +2488,17 @@ mod tests {
         ui.shutdown().await;
     }
 
-    /// Live: the model is a Codewhale coder, not a narrator of how it is reached.
+    /// Live: the model is the harness's coder, not a narrator of how it is reached.
     ///
     /// Reported from a real session: the model answered "I'm reached through the
     /// DeepSeek Chat web page, driven in a browser you're signed in to..." and
-    /// recited the session handshake, because the instruction text described the
-    /// wrapper instead of handing over Codewhale's own briefing. This sends the
-    /// same kind of bare message and requires an answer that does not talk about
+    /// recited a session handshake, because the wrapper's instruction text
+    /// described the wrapper instead of handing over the harness's own briefing.
+    /// No instruction text is written by the wrapper any more: the harness's
+    /// messages are the prompt, so the model sees the briefing and nothing else.
+    /// This sends a bare message and requires an answer that does not talk about
     /// its own transport, and it checks the audit to prove the briefing was
-    /// actually bridged.
+    /// actually bridged and that nothing was added around it.
     #[tokio::test]
     #[ignore = "needs a signed-in DeepSeek Chat profile; run with -- --ignored --nocapture"]
     async fn live_the_model_is_a_coder_not_a_narrator_of_its_transport() {
@@ -2347,10 +2507,6 @@ mod tests {
         let (dir, profile) = profile_copy();
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
-        assert!(
-            config.relay.forward_system_prompt,
-            "Codewhale's briefing is what makes this a coder rather than a narrator"
-        );
         let ui = Arc::new(BrowserChat {
             spec: BrowserSpec {
                 config: config.clone(),
@@ -2372,7 +2528,7 @@ mod tests {
         ui.ensure_open().await.expect("open the browser");
         let audit_dir = dir.path().join("audit");
         let audit = JsonlAudit::create(&audit_dir).await.expect("audit log");
-        let state = ServerState::new("secret", ui.clone(), audit);
+        let state = live_state("secret", ui.clone(), audit, BridgeOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2417,6 +2573,19 @@ mod tests {
             prompt_seen.contains("BRIEFING-MARKER"),
             "Codewhale's briefing must reach the page"
         );
+        // And nothing else: no wrapper-written preamble, no contract, no reminder.
+        for authored in [
+            "You are a Codewhale coder",
+            "Codewhale request:",
+            "Reminder: prose finishes the turn",
+            "Here is the answer.",
+        ] {
+            assert!(
+                !prompt_seen.contains(authored),
+                "the wrapper wrote its own prompt again ({authored:?}); the prompt must be \
+                 the harness's request and nothing else"
+            );
+        }
 
         // And the answer is about the work, not about the wrapper's plumbing.
         let lower = reply.to_lowercase();
@@ -2436,14 +2605,13 @@ mod tests {
         ui.shutdown().await;
     }
 
-    /// Live: the reported message does not end the turn on a promise.
+    /// Live: the reported message comes back as a delivered reply.
     ///
     /// The input is the user's own, verbatim — not a prompt written to elicit a
     /// tool call, which is what made the first version of this test prove so
-    /// little. A live model is stochastic, so this asserts the *guarantee* the
-    /// relay provides (the turn ends either on an action or on a marked answer,
-    /// never on an unmarked promise) and prints which happened; the deterministic
-    /// guarantee lives in the offline tests for `needs_protocol_retry`.
+    /// little. A live model is stochastic, so this asserts the guarantee the relay
+    /// actually provides — whatever the page says is delivered, parsed and never
+    /// dropped, with no re-ask and no rewriting — and prints what happened.
     #[tokio::test]
     #[ignore = "needs a signed-in DeepSeek Chat profile; run with -- --ignored --nocapture"]
     async fn live_a_chatty_request_does_not_end_the_turn_on_a_promise() {
@@ -2471,7 +2639,12 @@ mod tests {
             last_http_status: Mutex::new(None),
         });
         ui.ensure_open().await.expect("open the browser");
-        let state = ServerState::new("secret", ui.clone(), Arc::new(QuietAudit));
+        let state = live_state(
+            "secret",
+            ui.clone(),
+            Arc::new(QuietAudit),
+            BridgeOptions::default(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -2517,19 +2690,17 @@ mod tests {
             .unwrap_or_default();
         let content = message["content"].as_str().unwrap_or_default();
         eprintln!("[loop] finish_reason={finish:?} content={content:?}");
-        // The invariant the mechanism actually provides: the turn does not end on
-        // an unmarked promise. Either the model acted, or it delivered an answer
-        // that the contract marks as one. A live model can still drift, so this
-        // asserts the guarantee rather than a hoped-for behaviour.
+        // The invariant the mechanism provides: the page's reply is delivered.
+        // Either the model acted (a tool call was parsed out of what it wrote) or
+        // it answered in prose, which on this transport *is* the answer. Nothing
+        // is dropped, re-asked or rewritten in between.
         let acted = finish == "tool_calls"
             && message["tool_calls"]
                 .as_array()
                 .is_some_and(|calls| !calls.is_empty());
-        let answered = content.trim_start().starts_with("Here is the answer.");
         assert!(
-            acted || answered,
-            "the turn ended on something that is neither an action nor a marked \
-             answer, which is the failure this pins: finish_reason={finish:?} \
+            acted || !content.trim().is_empty(),
+            "the turn delivered nothing at all: finish_reason={finish:?} \
              content={content:?}"
         );
         ui.shutdown().await;
@@ -2767,7 +2938,7 @@ mod tests {
     /// for the profile a real session is using.
     fn profile_copy() -> (tempfile::TempDir, PathBuf) {
         let home = default_home().expect("codewhale home");
-        let source = home.join("deepseek-chat").join("browser");
+        let source = provider_profile(&home);
         let dir = tempfile::tempdir().expect("tempdir");
         let profile = dir.path().join("browser-copy");
         assert!(
@@ -2910,7 +3081,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: config.providers[0].chat.url.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: Some("http://127.0.0.1:9222".to_owned()),
             },
             session: Mutex::new(None),
@@ -3142,7 +3313,7 @@ mod tests {
         let mut config = Config::load(Some(&config::user_config_path(&home))).expect("config");
         config.browser.headless = true;
 
-        let source = home.join("deepseek-chat").join("browser");
+        let source = provider_profile(&home);
         let dir = tempfile::tempdir().expect("tempdir");
         let profile = dir.path().join("browser-copy");
         let copied = std::process::Command::new("cp")
@@ -3495,7 +3666,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: linked.unwrap_or_else(|| config.providers[0].chat.url.clone()),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -3567,7 +3738,7 @@ mod tests {
                 config: config.clone(),
                 provider: config.providers[0].clone(),
                 url: conversation.clone(),
-                profile: home.join("deepseek-chat").join("browser"),
+                profile: provider_profile(&home),
                 cdp_endpoint: None,
             },
             session: Mutex::new(None),
@@ -3781,7 +3952,7 @@ mod tests {
                         ws_xpixel: 0,
                         ws_ypixel: 0,
                     };
-                    libc::ioctl(master, libc::TIOCSWINSZ.into(), &window);
+                    libc::ioctl(master, libc::TIOCSWINSZ, &window);
                     Self {
                         master: std::fs::File::from_raw_fd(master),
                         slave,
@@ -3897,7 +4068,7 @@ mod tests {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -4044,5 +4215,111 @@ mod tests {
 
         run.reap();
         eprintln!("[tty] the terminal stayed raw for wrapper {wrapper}");
+    }
+
+    /// Issue #8 and #9 against a real page shape.
+    ///
+    /// DeepSeek with DeepThink on renders the model's reasoning above its answer,
+    /// as markdown inside a `.ds-think-content` panel — DeepSeek's own stylesheet
+    /// says exactly that (`.ds-think-content .ds-markdown { … }`), which is why it
+    /// used to match the `assistant` selector and reach the harness as the model's
+    /// answer. The page here models that shape, with the reasoning appearing
+    /// first and the answer 300 ms later.
+    ///
+    /// The reply must be the answer text, and the reasoning must not appear in
+    /// the reply *or* in a single streamed snapshot.
+    #[tokio::test]
+    async fn the_pages_reasoning_is_never_the_reply() {
+        let playwright = Playwright::launch().await.expect("Playwright driver");
+        let browser = playwright
+            .chromium()
+            .launch()
+            .await
+            .expect("Playwright Chromium");
+        let context = browser.new_context().await.expect("browser context");
+        let page = context.new_page().await.expect("fixture page");
+        page.set_content(
+            r#"<!doctype html><main>
+                <textarea placeholder="Message"></textarea>
+                <button type="submit" aria-label="Send">Send</button>
+              </main>
+              <script>
+                document.querySelector('button[type=submit]').addEventListener('click', () => {
+                  const composer = document.querySelector('textarea');
+                  composer.value = '';
+                  const main = document.querySelector('main');
+                  // The page thinks first: markdown, inside the think panel.
+                  const thinking = document.createElement('div');
+                  thinking.className = 'ds-think-content';
+                  const reasoning = document.createElement('div');
+                  reasoning.className = 'ds-markdown';
+                  reasoning.textContent =
+                    'The user just says "hello, how are you?" This is for asking.';
+                  thinking.append(reasoning);
+                  main.append(thinking);
+                  // Then the answer, which the wrapper must read.
+                  setTimeout(() => {
+                    const answer = document.createElement('div');
+                    answer.className = 'ds-markdown';
+                    answer.textContent = 'Hello! I am doing well.';
+                    main.append(answer);
+                  }, 300);
+                });
+              </script>"#,
+            None,
+        )
+        .await
+        .expect("install local UI fixture");
+
+        let config = Config::defaults();
+        let ui = BrowserChat {
+            spec: BrowserSpec {
+                config: config.clone(),
+                provider: config.providers[0].clone(),
+                url: "https://chat.deepseek.com".to_owned(),
+                profile: PathBuf::from("/nonexistent-test-profile"),
+                cdp_endpoint: None,
+            },
+            session: Mutex::new(Some(
+                Session::new(page.clone(), playwright, context, true)
+                    .await
+                    .expect("session"),
+            )),
+            transport: TransportMode::Gui,
+            api: config.transport.api.clone(),
+            api_timeout: Duration::from_secs(30),
+            keep_alive: true,
+            response_timeout: config.timeouts.response(),
+            model_label: Mutex::new(None),
+            resume_url: Mutex::new(String::new()),
+            last_http_status: Mutex::new(None),
+        };
+
+        let (snapshots, mut seen) = tokio::sync::mpsc::channel::<String>(16);
+        let collected = tokio::spawn(async move {
+            let mut all = Vec::new();
+            while let Some(snapshot) = seen.recv().await {
+                all.push(snapshot);
+            }
+            all
+        });
+
+        let answer = ui
+            .send_streaming("fixture prompt", false, snapshots)
+            .await
+            .expect("visible UI response");
+        ui.shutdown().await;
+        let snapshots = collected.await.expect("snapshot collector");
+
+        assert_eq!(
+            answer, "Hello! I am doing well.",
+            "the reply must be the page's answer, never its reasoning"
+        );
+        for snapshot in &snapshots {
+            assert!(
+                !snapshot.contains("The user just says"),
+                "the page's reasoning reached the stream: {snapshot:?}"
+            );
+        }
     }
 }

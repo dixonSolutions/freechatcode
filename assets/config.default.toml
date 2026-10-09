@@ -55,6 +55,14 @@ routed_url_pattern = "/a/chat/s/"
 [providers.selectors]
 composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
 assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
+# The model's reasoning, when the page renders one above the answer. Excluded
+# from every read of `assistant` — it is the page's own readout, not the model's
+# reply, and on DeepSeek (DeepThink on) it is markdown inside this container, so
+# it would otherwise match `assistant` and be delivered as the answer.
+# Verified in DeepSeek's own stylesheet: `.ds-think-content .ds-markdown { … }`.
+# The answer body is `.ds-assistant-message-main-content`. Set to "" for a page
+# that renders no reasoning.
+reasoning = ".ds-think-content"
 send = "button[type='submit'], button[aria-label*='send' i], [data-testid*='send']"
 new_chat = "button[aria-label*='new chat' i], button[title*='new chat' i], [data-testid*='new-chat']"
 search_toggle = "div.ds-toggle-button:has-text('Search')"
@@ -124,23 +132,11 @@ allow_extra = []
 # browser, for example when a linked conversation is no longer reachable and a
 # new chat is opened instead.
 desktop_notifications = true
-# Forward Codewhale's own system message into the chat. It carries the full
-# project briefing — project context, constitution, skills index — and it is on
-# by default because that briefing *is* the model's context: it makes the model a
-# Codewhale coder with the real workspace in front of it, rather than a model the
-# wrapper describes itself to. The instruction text in assets/system-prompt.md is
-# only the transport contract (prose or a tool-calls object), nothing about how
-# the session is reached. Turn this off to send a smaller prompt.
-forward_system_prompt = true
 
 # Machine-specific values. These have no defaults — set them in your user
 # config, not here.
 [codewhale]
 # binary = "/home/you/.cargo/bin/codewhale"
-# Instruction text sent to the chat model. Unset uses the committed
-# assets/system-prompt.md embedded in the binary. `{project_dir}` and
-# `{payload}` are filled in at runtime.
-# system_prompt = "/path/to/system-prompt.md"
 
 [browser]
 # How the relay gets a browser to drive.

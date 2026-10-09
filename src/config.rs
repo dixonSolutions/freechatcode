@@ -108,18 +108,12 @@ pub struct RelayConfig {
     /// (for example, a linked conversation is no longer reachable).
     #[serde(default = "default_true")]
     pub desktop_notifications: bool,
-    /// Forward Codewhale's own system message into the chat. It carries the full
-    /// project briefing, so it stays off by default and the instruction text
-    /// identifies the session instead.
-    #[serde(default)]
-    pub forward_system_prompt: bool,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             desktop_notifications: true,
-            forward_system_prompt: true,
         }
     }
 }
@@ -141,6 +135,16 @@ pub struct Selectors {
     pub search_toggle: String,
     pub thinking_toggle: String,
     pub file_upload: String,
+    /// Element holding the model's **reasoning** on a page that renders one
+    /// above the answer (DeepSeek with DeepThink on: `.ds-think-content`).
+    ///
+    /// It is not part of the reply: matches are excluded from every read of
+    /// `assistant`, so the page's thinking is never delivered as the answer and
+    /// never streamed. On DeepSeek the reasoning is markdown inside this
+    /// container, so it would otherwise match `assistant` itself. Empty
+    /// disables the exclusion (a page that renders no reasoning).
+    #[serde(default)]
+    pub reasoning: String,
     /// Element whose text names the model in use (e.g. a model picker button).
     /// Empty disables model attribution from the page; the turn log then records
     /// the model as "unknown".
@@ -231,10 +235,6 @@ pub struct CodewhaleConfig {
     /// Explicit path to the `codewhale` executable.
     #[serde(default)]
     pub binary: Option<String>,
-    /// Path to the instruction text handed to the chat model. When unset, the
-    /// committed `assets/system-prompt.md` embedded in the binary is used.
-    #[serde(default)]
-    pub system_prompt: Option<String>,
 }
 
 /// How the relay obtains a browser to drive.
@@ -870,7 +870,6 @@ mod tests {
         assert!(config.providers[0].selectors.composer.contains("textarea"));
         assert_eq!(config.timeouts.login_wait_secs, 900);
         assert!(config.codewhale.binary.is_none());
-        assert!(config.codewhale.system_prompt.is_none());
         assert!(config.tools.forward_all);
         assert_eq!(config.tools.search, vec!["tool_search".to_owned()]);
         assert!(config.tools.essential.is_empty());

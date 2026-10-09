@@ -76,6 +76,9 @@ assistant = ".ds-markdown, [data-message-role='assistant'], …"
 send      = "button[type='submit'], button[aria-label*='send' i], …"
 new_chat  = "button[aria-label*='new chat' i], …"
 file_upload = "input[type='file'], …"
+# The page's own reasoning block, when it renders one above the answer. Excluded
+# from every read of `assistant`, so it is never the reply and never streamed.
+reasoning = ".ds-think-content"
 
 # A "model" is a set of page state. DeepSeek's model is selected by chips.
 [[providers.models]]
