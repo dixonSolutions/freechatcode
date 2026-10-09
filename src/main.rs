@@ -105,6 +105,12 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Check each configured provider: browser, composer, sign-in.
+    Doctor {
+        /// Check only this provider (default: all configured providers).
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Find (and remember) the codewhale binary, then run the bridge.
     Launch {
         /// Optional codewhale executable name or path to track down.
@@ -1725,6 +1731,87 @@ fn migrate_provider_dirs(home: &Path) {
     }
 }
 
+/// Build the browser driver for one provider, resolving its profile directory
+/// (an explicit override wins, otherwise `~/.codewhale/providers/<id>/browser`).
+fn make_browser(
+    config: &Config,
+    provider: &Provider,
+    home: &Path,
+    profile_override: Option<PathBuf>,
+    cdp_endpoint: Option<String>,
+    url: String,
+) -> BrowserChat {
+    let profile = profile_override
+        .unwrap_or_else(|| home.join("providers").join(&provider.id).join("browser"));
+    BrowserChat {
+        spec: BrowserSpec {
+            config: config.clone(),
+            provider: provider.clone(),
+            url,
+            profile,
+            cdp_endpoint,
+        },
+        session: Mutex::new(None),
+        transport: config.transport.mode,
+        api: config.transport.api.clone(),
+        api_timeout: Duration::from_secs(config.transport.api.timeout_secs.max(1)),
+        keep_alive: config.browser.keep_alive,
+        response_timeout: config.timeouts.response(),
+        model_label: Mutex::new(None),
+        resume_url: Mutex::new(String::new()),
+        last_http_status: Mutex::new(None),
+    }
+}
+
+/// Check each configured (or the one named) provider: can a browser open, and is
+/// the composer present? This is the "set up one provider at a time" path — it
+/// never types anything, it only verifies reachability and sign-in.
+async fn run_doctor(config: &Config, home: &Path, filter: Option<&str>) -> Result<()> {
+    let providers: Vec<&Provider> = match filter {
+        Some(id) => match config.provider(id) {
+            Some(provider) => vec![provider],
+            None => bail!(
+                "no provider named {id}; configured: {}",
+                config
+                    .providers
+                    .iter()
+                    .map(|provider| provider.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        None => config.providers.iter().collect(),
+    };
+    let cdp_endpoint = config.browser.cdp_endpoint.clone();
+    for provider in providers {
+        println!("Checking provider {} ({})…", provider.name, provider.id);
+        let browser = make_browser(
+            config,
+            provider,
+            home,
+            config.browser.profile_dir.clone().map(PathBuf::from),
+            cdp_endpoint.clone(),
+            provider.chat.url.clone(),
+        );
+        match browser.ensure_open().await {
+            Ok(()) => {
+                println!("  OK — browser opened and the composer is present.");
+                browser.shutdown().await;
+            }
+            Err(error) => {
+                let failure = browser.classify(&error).await;
+                println!(
+                    "  FAILED [{} / {}]: {}",
+                    failure.kind,
+                    failure.blame,
+                    first_line(&error)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_home() -> Result<PathBuf> {
     let home = if let Some(home) = std::env::var_os("CODEWHALE_HOME") {
         PathBuf::from(home)
@@ -1805,6 +1892,13 @@ async fn run() -> Result<()> {
         }
         Some(Commands::Turns { limit }) => {
             print_turns(&default_home()?, limit)?;
+            return Ok(());
+        }
+        Some(Commands::Doctor { provider }) => {
+            let home = default_home()?;
+            let config = Config::load_with_mode(Some(&config::user_config_path(&home)), None)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            run_doctor(&config, &home, provider.as_deref()).await?;
             return Ok(());
         }
         Some(Commands::Tui) => {
@@ -1927,14 +2021,13 @@ async fn run() -> Result<()> {
         tokio::sync::mpsc::channel::<String>(config.providers.len().max(1));
 
     // One tab (and one conversation) per provider, all served by this one relay.
+    let profile_override = args
+        .profile_dir
+        .clone()
+        .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from));
     let mut route_groups: Vec<RouteGroup> = Vec::new();
     let mut browsers: Vec<Arc<BrowserChat>> = Vec::new();
     for entry in &config.providers {
-        let profile = args
-            .profile_dir
-            .clone()
-            .or_else(|| config.browser.profile_dir.clone().map(PathBuf::from))
-            .unwrap_or_else(|| home.join("providers").join(&entry.id).join("browser"));
         // `--chat-url` overrides the active provider's base URL; every other
         // provider opens at its configured URL.
         let base_url = if entry.id == provider.id {
@@ -1962,24 +2055,14 @@ async fn run() -> Result<()> {
         }
         let open_url = linked_url.unwrap_or(base_url);
 
-        let browser = Arc::new(BrowserChat {
-            spec: BrowserSpec {
-                config: config.clone(),
-                provider: entry.clone(),
-                url: open_url,
-                profile,
-                cdp_endpoint: cdp_endpoint.clone(),
-            },
-            session: Mutex::new(None),
-            transport: config.transport.mode,
-            api: config.transport.api.clone(),
-            api_timeout: Duration::from_secs(config.transport.api.timeout_secs.max(1)),
-            keep_alive: config.browser.keep_alive,
-            response_timeout: config.timeouts.response(),
-            model_label: Mutex::new(None),
-            resume_url: Mutex::new(String::new()),
-            last_http_status: Mutex::new(None),
-        });
+        let browser = Arc::new(make_browser(
+            &config,
+            entry,
+            &home,
+            profile_override.clone(),
+            cdp_endpoint.clone(),
+            open_url,
+        ));
         browsers.push(Arc::clone(&browser));
         let stale_link = Arc::new(AtomicBool::new(false));
         {
