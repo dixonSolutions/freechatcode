@@ -1,5 +1,20 @@
 # STATUS
 
+> **Current verification (2026-10-09):** 93 active tests pass (66 library,
+> 27 binary); 23 live tests are opt-in. Clippy with warnings denied and formatting
+> pass. Real DeepSeek checks covered streaming, DeepThink on/off through the
+> production wrapper, browser crash recovery, six-turn virtualized transcripts,
+> keep-alive off, terminal handover, and Codewhale file reads. A real OpenCode
+> run executed a file read and returned its token; its title and main turns used
+> the same chat. Gemini returned `GEMINI-BRIDGE-CHECK` through the Rust browser
+> adapter. The Gemini configure/default/launch CLI also passed a real OpenCode
+> run, returning `GEMINI-HARNESS-CHECK`. DeepSeek read tokens from both a real file and uploaded image.
+> Independent browser tabs also returned distinct replies concurrently. The new
+> 32-second demo shows actual reads, an edit, and two passing tests, with an
+> independent verification afterward. Google AI Mode reported unavailable for this device/account, so its
+> template is **not verified**. Model prose instead of tools remains tracked in
+> issue #16. The historical measurements below are not current guarantees.
+
 What FreeChatCode can do, what was verified, and what was not. Last updated
 2026-10-08 on the machine described under [Environment](#environment).
 
@@ -23,9 +38,8 @@ What FreeChatCode can do, what was verified, and what was not. Last updated
 > styles as `.ds-think-content .ds-markdown { … }` — so it is never read as the
 > reply and never streamed; it is ignored, not translated. Everything below that
 > describes the instruction text, the contract, the marker or the re-ask is the
-> record **before** this change, left as it was measured. Current offline gate:
-> `cargo test --locked` — 56 lib + 24 bin passing, 0 failing, 20 live tests
-> ignored by default.
+> record **before** this change, left as it was measured. The offline gate at that point was 56 lib + 24 bin passing, with 20 live tests
+> ignored; the current gate is recorded at the top of this file.
 
 The short version: the bridge works end to end. A real `codewhale` 0.10.0
 process was driven through the local relay, the browser, and the live DeepSeek
@@ -44,7 +58,7 @@ per-request proof-of-work header. See [Gaps](#gaps--what-is-not-verified).
 ## Reproduce the checks
 
 ```bash
-cargo test --locked                            # 72 tests, offline, no provider call
+cargo test --locked                            # 93 active tests, no provider call
 cargo test --locked -- --ignored --nocapture   # live tests: real browser, real chat page
 cargo clippy --locked --all-targets            # 0 warnings
 cargo fmt --check

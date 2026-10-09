@@ -3,9 +3,10 @@
 Status: **mostly implemented and verified** — the provider abstraction
 (`[[providers]]` config, config-driven relay catalog, per-model `set_model_state`),
 harness adapters (codewhale + opencode), and the multi-provider launcher (one tab
-per provider, one relay) are landed with tests. Still open: sharing one Chromium
-context across tabs, the `doctor`/`test` setup probe, Gemini's live selector
-verification, and openclaw/hermes adapters. This doc defines the target and
+per provider, one relay) are landed with tests. Independent agent tabs share their provider context; `doctor` returns failure
+when a setup probe fails, and Gemini has a passing live browser test. Still open:
+Google AI Mode availability, live subagent harness coverage, and openclaw/hermes
+adapters. This doc defines the target and
 builds on, without replacing, [docs/design.md](design.md) — the "who owns what"
 split there is still the law of the project.
 

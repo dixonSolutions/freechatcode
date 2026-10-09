@@ -62,6 +62,16 @@ pub fn spawn_contract(
     token: &str,
     model_id: &str,
 ) -> Result<HarnessSpawn> {
+    spawn_contract_with_models(kind, base_url, token, model_id, &[model_id.to_owned()])
+}
+
+pub fn spawn_contract_with_models(
+    kind: HarnessKind,
+    base_url: &str,
+    token: &str,
+    model_id: &str,
+    models: &[String],
+) -> Result<HarnessSpawn> {
     match kind {
         HarnessKind::Codewhale => Ok(HarnessSpawn {
             argv: vec![
@@ -83,6 +93,7 @@ pub fn spawn_contract(
             // at the relay without touching the user's own config.
             let config = serde_json::json!({
                 "$schema": "https://opencode.ai/config.json",
+                "enabled_providers": ["freechat"],
                 "provider": {
                     "freechat": {
                         "npm": "@ai-sdk/openai-compatible",
@@ -91,12 +102,7 @@ pub fn spawn_contract(
                             "baseURL": base_url,
                             "apiKey": token,
                         },
-                        "models": {
-                            model_id: {
-                                "name": model_id,
-                                "tool_call": true,
-                            },
-                        },
+                        "models": models.iter().map(|id|(id.clone(),serde_json::json!({"name":id,"tool_call":true}))).collect::<serde_json::Map<String,serde_json::Value>>(),
                     },
                 },
             });

@@ -48,6 +48,10 @@ pub fn migrate_legacy_home(home: &Path) {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    #[serde(default)]
+    pub default_all: bool,
     pub providers: Vec<Provider>,
     pub timeouts: Timeouts,
     #[serde(default)]
@@ -118,7 +122,7 @@ impl Default for RelayConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ChatConfig {
     pub url: String,
     pub allowed_hosts: Vec<String>,
@@ -126,7 +130,7 @@ pub struct ChatConfig {
     pub routed_url_pattern: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Selectors {
     pub composer: String,
     pub assistant: String,
@@ -135,6 +139,12 @@ pub struct Selectors {
     pub search_toggle: String,
     pub thinking_toggle: String,
     pub file_upload: String,
+    #[serde(default)]
+    pub rename_menu: String,
+    #[serde(default)]
+    pub rename_action: String,
+    #[serde(default)]
+    pub rename_input: String,
     /// Element holding the model's **reasoning** on a page that renders one
     /// above the answer (DeepSeek with DeepThink on: `.ds-think-content`).
     ///
@@ -155,7 +165,7 @@ pub struct Selectors {
 /// One free chat site the wrapper can drive: its URL, its DOM selectors, and
 /// the models it exposes (each model being page state — a toggle, a dropdown —
 /// on top of that one site).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Provider {
     pub id: String,
     pub name: String,
@@ -169,7 +179,7 @@ pub struct Provider {
 /// One model a provider exposes. A model is not necessarily a separate thread:
 /// it is a name plus the page state that selects it (e.g. DeepSeek's DeepThink
 /// chip). Two models on one provider share one conversation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProviderModel {
     pub id: String,
     #[serde(default)]
@@ -182,7 +192,7 @@ pub struct ProviderModel {
 }
 
 /// A page control and the state it should be in for a model.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Toggle {
     /// Selector of the control to click.
     pub selector: String,
@@ -665,8 +675,10 @@ impl Config {
     /// The first model of the first provider, used when no `--model` is given.
     #[must_use]
     pub fn default_model_id(&self) -> Option<&str> {
-        self.providers
-            .first()
+        self.default_provider
+            .as_deref()
+            .and_then(|id| self.provider(id))
+            .or_else(|| self.providers.first())
             .and_then(|provider| provider.models.first())
             .map(|model| model.id.as_str())
     }
@@ -739,9 +751,33 @@ impl Config {
             toml::Value::String(mode.as_str().to_owned()),
         );
 
-        merged
+        let config: Self = merged
             .try_into()
-            .map_err(|error| format!("invalid configuration: {error}"))
+            .map_err(|error| format!("invalid configuration: {error}"))?;
+        let mut ids = std::collections::HashSet::new();
+        let mut models = std::collections::HashSet::new();
+        for provider in &config.providers {
+            if provider.id.is_empty()
+                || !provider
+                    .id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(
+                    "provider IDs must contain only letters, numbers, hyphens, and underscores"
+                        .into(),
+                );
+            }
+            if !ids.insert(&provider.id) {
+                return Err(format!("duplicate provider ID: {}", provider.id));
+            }
+            for model in &provider.models {
+                if model.id.is_empty() || !models.insert(&model.id) {
+                    return Err(format!("empty or duplicate model ID: {}", model.id));
+                }
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -809,6 +845,45 @@ pub fn remember_binary(user_path: &Path, binary: &Path) -> Result<(), String> {
     std::fs::write(user_path, text)
         .map_err(|error| format!("write {}: {error}", user_path.display()))?;
     restrict_file(user_path)
+}
+
+/// Update provider selection atomically while preserving other user settings.
+pub fn save_providers(path: &Path, config: &Config) -> Result<(), String> {
+    let mut document = match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str::<toml::Value>(&text).map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let table = document.as_table_mut().ok_or("config must be a table")?;
+    table.insert(
+        "providers".into(),
+        toml::Value::try_from(&config.providers).map_err(|e| e.to_string())?,
+    );
+    if let Some(id) = &config.default_provider {
+        table.insert("default_provider".into(), toml::Value::String(id.clone()));
+    } else {
+        table.remove("default_provider");
+    }
+    table.insert(
+        "default_all".into(),
+        toml::Value::Boolean(config.default_all),
+    );
+    let parent = path.parent().ok_or("config has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    restrict_directory(parent)?;
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    file.write_all(
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    file.as_file().sync_all().map_err(|e| e.to_string())?;
+    file.persist(path).map_err(|e| e.to_string())?;
+    restrict_file(path)
 }
 
 #[cfg(unix)]

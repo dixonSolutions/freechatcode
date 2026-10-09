@@ -1,0 +1,43 @@
+# Additional provider templates. Configure verifies the composer after sign-in;
+# these are experimental until an authenticated response has been tested.
+[[providers]]
+id = "gemini"
+name = "Gemini"
+[providers.chat]
+url = "https://gemini.google.com/app"
+allowed_hosts = ["gemini.google.com"]
+routed_url_pattern = "/app/"
+[providers.selectors]
+composer = "[contenteditable='true'][role='textbox']"
+assistant = "model-response .markdown, model-response message-content"
+send = "button[aria-label*='Send' i]"
+new_chat = "a[href='/app']"
+search_toggle = ""
+thinking_toggle = ""
+file_upload = "input[type='file']"
+reasoning = "thinking-overlay, thoughts-container"
+model_label = "button[aria-label*='mode picker' i]"
+[[providers.models]]
+id = "gemini"
+name = "Gemini (page-selected model)"
+
+[[providers]]
+id = "google-ai-mode"
+name = "GoogleAIMode"
+[providers.chat]
+url = "https://www.google.com/ai"
+allowed_hosts = ["www.google.com", "google.com"]
+routed_url_pattern = "/search"
+[providers.selectors]
+composer = "textarea, [contenteditable='true'][role='textbox']"
+assistant = "[data-message-role='assistant'], [data-role='assistant']"
+send = "button[aria-label*='Send' i]"
+new_chat = "a[href='/ai']"
+search_toggle = ""
+thinking_toggle = ""
+file_upload = "input[type='file']"
+reasoning = ""
+model_label = ""
+[[providers.models]]
+id = "google-ai-mode"
+name = "Google AI Mode"

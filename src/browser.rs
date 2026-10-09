@@ -34,8 +34,9 @@ pub(crate) struct BrowserSpec {
 
 /// A live browser: the page the relay drives plus the handles that keep it up.
 pub(crate) struct Session {
+    pub(crate) borrowed: bool,
     pub(crate) page: Page,
-    pub(crate) playwright: Playwright,
+    pub(crate) playwright: Arc<Playwright>,
     pub(crate) context: BrowserContext,
     /// A wrapper-owned browser is closed on exit; an attached one is not.
     pub(crate) managed: bool,
@@ -48,7 +49,7 @@ impl Session {
     /// "the browser is gone" from "the page is slow" without a round trip.
     pub(crate) async fn new(
         page: Page,
-        playwright: Playwright,
+        playwright: impl Into<Arc<Playwright>>,
         context: BrowserContext,
         managed: bool,
     ) -> Result<Self> {
@@ -62,8 +63,9 @@ impl Session {
             eprintln!("freechatcode: could not watch the browser context for closure: {error}");
         }
         Ok(Self {
+            borrowed: false,
             page,
-            playwright,
+            playwright: playwright.into(),
             context,
             managed,
             closed,
@@ -122,6 +124,7 @@ pub(crate) async fn watched_context(
 /// Drives the DeepSeek Chat page — and, for the `api` transport, the site's own
 /// completion endpoint from inside that page.
 pub(crate) struct BrowserChat {
+    pub(crate) parent: Option<Arc<BrowserChat>>,
     pub(crate) spec: BrowserSpec,
     /// The live browser, held across turns unless `[browser] keep_alive` is off.
     pub(crate) session: Mutex<Option<Session>>,
@@ -142,6 +145,24 @@ pub(crate) struct BrowserChat {
 }
 
 impl BrowserChat {
+    pub(crate) fn fork_browser(self: &Arc<Self>) -> Arc<BrowserChat> {
+        let mut spec = self.spec.clone();
+        spec.url = spec.provider.chat.url.clone();
+        Arc::new(BrowserChat {
+            parent: Some(Arc::clone(self)),
+            spec,
+            session: Mutex::new(None),
+            transport: self.transport,
+            api: self.api.clone(),
+            api_timeout: self.api_timeout,
+            keep_alive: self.keep_alive,
+            response_timeout: self.response_timeout,
+            model_label: Mutex::new(None),
+            resume_url: Mutex::new(String::new()),
+            last_http_status: Mutex::new(None),
+        })
+    }
+
     pub(crate) fn selectors(&self) -> &Selectors {
         &self.spec.provider.selectors
     }
@@ -184,13 +205,12 @@ impl BrowserChat {
             .into_iter()
             .next()
             .context("attach to an existing Chromium context")?;
-        let page = match context.pages().into_iter().next() {
-            Some(page) => {
-                if !self.spec.provider.chat.accepts_url(&page.url()) {
-                    self.navigate(&page).await?;
-                }
-                page
-            }
+        let page = match context
+            .pages()
+            .into_iter()
+            .find(|page| self.spec.provider.chat.accepts_url(&page.url()))
+        {
+            Some(page) => page,
             None => {
                 let page = context
                     .new_page()
@@ -241,6 +261,11 @@ impl BrowserChat {
         let mut installed_browser = false;
         loop {
             let mut options = BrowserContextOptions::builder().headless(headless);
+            if !headless {
+                options = options.no_viewport(true);
+            } else if let Some((width, height)) = config.browser.video_size() {
+                options = options.viewport(Viewport { width, height });
+            }
             if let Some(dir) = config.browser.record_video_dir.as_deref() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("create video directory {dir}"))?;
@@ -459,7 +484,24 @@ impl BrowserChat {
             }
         }
         if guard.is_none() {
-            *guard = Some(self.open().await.map_err(|error| format!("{error:#}"))?);
+            if let Some(parent) = &self.parent {
+                Box::pin(parent.ensure_open()).await?;
+                let root = parent.session.lock().await;
+                let root = root.as_ref().ok_or("parent browser is not open")?;
+                let page = root.context.new_page().await.map_err(|e| e.to_string())?;
+                self.navigate(&page).await.map_err(|e| e.to_string())?;
+                self.wait_for_composer(&page, self.timeouts().login_wait())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut session =
+                    Session::new(page, root.playwright.clone(), root.context.clone(), false)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                session.borrowed = true;
+                *guard = Some(session);
+            } else {
+                *guard = Some(self.open().await.map_err(|error| format!("{error:#}"))?);
+            }
         }
         Ok(())
     }
@@ -662,6 +704,22 @@ impl BrowserChat {
             && let Some(session) = guard.take()
         {
             close_session(session).await;
+            if let Some(parent) = &self.parent {
+                let mut root = parent.session.lock().await;
+                let unused = root.as_ref().is_some_and(|session| {
+                    session.managed
+                        && session
+                            .context
+                            .pages()
+                            .iter()
+                            .filter(|page| !page.is_closed())
+                            .count()
+                            <= 1
+                });
+                if unused && let Some(session) = root.take() {
+                    close_session(session).await;
+                }
+            }
         }
         outcome
     }
@@ -731,6 +789,7 @@ impl BrowserChat {
         if start_new_chat {
             self.start_new_chat(page).await?;
         }
+        self.upload_attachments(page, prompt).await?;
         let composer = page.locator(&self.selectors().composer).first();
         if !composer.is_visible().await.unwrap_or(false) {
             return Err("DeepSeek Chat composer is no longer visible".into());
@@ -764,6 +823,36 @@ impl BrowserChat {
             })?;
         let send = page.locator(&self.selectors().send);
         if send.count().await.unwrap_or(0) > 0 && send.last().is_visible().await.unwrap_or(false) {
+            // File parsing disables custom div-based controls as well as native
+            // buttons. Playwright's native enabled check alone misses those.
+            let ready_by = Instant::now() + action;
+            loop {
+                let enabled = send.last().is_enabled().await.unwrap_or(false)
+                    && send
+                        .last()
+                        .get_attribute("aria-disabled")
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        != Some("true")
+                    && !send
+                        .last()
+                        .get_attribute("class")
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .any(|class| class == "disabled" || class.ends_with("--disabled"));
+                if enabled {
+                    break;
+                }
+                if Instant::now() >= ready_by {
+                    return Err("send control stayed disabled; the provider may still be processing an attachment".into());
+                }
+                tokio::time::sleep(self.timeouts().poll()).await;
+            }
             tokio::time::timeout(action, send.last().click(None))
                 .await
                 .map_err(|_| "submitting the visible request timed out".to_owned())?
@@ -926,6 +1015,33 @@ impl BrowserChat {
         }
     }
 
+    pub(crate) async fn upload_attachments(&self, page: &Page, prompt: &str) -> Result<(), String> {
+        let attachments = freechatcode::attachments::from_prompt(prompt).await?;
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let selector = self.selectors().file_upload.trim();
+        if selector.is_empty() || page.locator(selector).count().await.unwrap_or(0) == 0 {
+            eprintln!(
+                "freechatcode: this provider has no file input; attachment data and paths remain in the request"
+            );
+            return Ok(());
+        }
+        let files: Vec<_> = attachments
+            .into_iter()
+            .map(|file| playwright_rs::FilePayload::new(file.name, file.mime, file.bytes))
+            .collect();
+        tokio::time::timeout(
+            self.timeouts().action(),
+            page.locator(selector)
+                .first()
+                .set_input_files_payload_multiple(&files, None),
+        )
+        .await
+        .map_err(|_| "attachment upload timed out".to_owned())?
+        .map_err(|e| format!("could not upload attachments: {e}"))
+    }
+
     /// Start a fresh conversation.
     ///
     /// Navigating back to the bare chat URL is the fast, reliable path — the
@@ -1043,7 +1159,12 @@ impl BrowserChat {
     /// The live page's URL, when a browser is open.
     pub(crate) async fn live_url(&self) -> Option<String> {
         let guard = self.session.lock().await;
-        guard.as_ref().map(|session| session.page.url())
+        if let Some(session) = guard.as_ref() {
+            return Some(session.page.url());
+        }
+        drop(guard);
+        let saved = self.resume_url.lock().await.clone();
+        (!saved.is_empty()).then_some(saved)
     }
 
     /// Close the browser for good at the end of the run.
@@ -1052,6 +1173,55 @@ impl BrowserChat {
         if let Some(session) = guard.take() {
             close_session(session).await;
         }
+    }
+
+    pub(crate) async fn rename_conversation(&self, title: &str) -> Result<(), String> {
+        let selectors = self.selectors();
+        if selectors.rename_menu.is_empty()
+            || selectors.rename_action.is_empty()
+            || selectors.rename_input.is_empty()
+        {
+            return Ok(());
+        }
+        let guard = self.session.lock().await;
+        let Some(session) = guard.as_ref() else {
+            return Ok(());
+        };
+        let page = &session.page;
+        let path = url::Url::parse(&page.url())
+            .map_err(|e| e.to_string())?
+            .path()
+            .to_owned();
+        let menu = selectors
+            .rename_menu
+            .replace("{chat_path}", &serde_json::to_string(&path).unwrap());
+        let action = async {
+            page.locator(&menu)
+                .dispatch_event("click", Some(serde_json::json!({"bubbles":true})))
+                .await?;
+            page.locator(&selectors.rename_action)
+                .first()
+                .click(None)
+                .await?;
+            let input = page.locator(&selectors.rename_input).first();
+            if input.is_visible().await.unwrap_or(false) {
+                input.fill(title, None).await?;
+                input.press("Enter", None).await
+            } else {
+                // A collapsed responsive sidebar still exposes its inline editor.
+                // Drive the same input/keydown events without resizing the page.
+                let _: serde_json::Value=input.evaluate("(input,title)=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,title);input.dispatchEvent(new Event('input',{bubbles:true}));return null;}",Some(title)).await?;
+                input.dispatch_event("keydown",Some(serde_json::json!({"key":"Enter","code":"Enter","keyCode":13,"bubbles":true}))).await
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(3), action)
+            .await
+            .map_err(|_| "chat rename timed out".to_owned())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        if result.is_err() {
+            let _ = page.keyboard().press("Escape", None).await;
+        }
+        result
     }
 }
 
@@ -1136,11 +1306,7 @@ pub(crate) fn reply_selector(selectors: &Selectors) -> String {
     if reasoning.is_empty() {
         return assistant.to_owned();
     }
-    assistant
-        .split(',')
-        .map(|one| format!("{}:not({reasoning}):not({reasoning} *)", one.trim()))
-        .collect::<Vec<_>>()
-        .join(", ")
+    format!(":is({assistant}):not(:is({reasoning})):not(:is({reasoning}) *)")
 }
 
 /// Classify a browser-level network error from its Chromium code.
@@ -1179,12 +1345,25 @@ pub(crate) async fn chip_is_selected(page: &Page, selector: &str) -> Option<bool
     if control.count().await.ok()? == 0 {
         return None;
     }
+    for attribute in ["aria-pressed", "aria-checked"] {
+        if let Some(value) = control.get_attribute(attribute).await.ok().flatten() {
+            match value.as_str() {
+                "true" => return Some(true),
+                "false" => return Some(false),
+                _ => {}
+            }
+        }
+    }
     control
         .get_attribute("class")
         .await
         .ok()
         .flatten()
-        .map(|class| class.contains("selected"))
+        .map(|class| {
+            class
+                .split_whitespace()
+                .any(|token| token == "selected" || token.ends_with("--selected"))
+        })
 }
 
 /// Playwright errors arrive with a node stack trace attached. Keep the one line
@@ -1215,6 +1394,10 @@ pub(crate) fn turn_is_recoverable(session: Option<&Session>, error: &str) -> boo
 /// loses its driver connection. A context that has already died is not an error
 /// — that is the case this whole path exists for.
 pub(crate) async fn close_session(session: Session) {
+    if session.borrowed {
+        let _ = session.page.close().await;
+        return;
+    }
     if session.managed
         && session.is_alive()
         && let Err(error) = session.context.close().await
@@ -1228,6 +1411,24 @@ pub(crate) async fn close_session(session: Session) {
 
 #[async_trait::async_trait]
 impl ChatUi for BrowserChat {
+    async fn prepare_turn(&self, start_new_chat: bool) -> Result<bool, String> {
+        let mut guard = self.session.lock().await;
+        self.ensure_live(&mut guard).await?;
+        if start_new_chat {
+            self.start_new_chat(&guard.as_ref().unwrap().page).await?;
+        }
+        Ok(false)
+    }
+    async fn fork(
+        self: Arc<Self>,
+        _identity: &freechatcode::ConversationIdentity,
+    ) -> Result<Arc<dyn ChatUi>, String> {
+        Ok(self.fork_browser())
+    }
+
+    async fn close(&self) {
+        self.shutdown().await;
+    }
     async fn send(&self, prompt: &str, start_new_chat: bool) -> Result<String, String> {
         self.turn(prompt, start_new_chat, None).await
     }
@@ -1254,6 +1455,7 @@ impl ChatUi for BrowserChat {
     /// log says pro would be a lie.
     async fn set_model_state(&self, toggles: &[Toggle]) -> Result<(), String> {
         let mut guard = self.session.lock().await;
+        self.ensure_live(&mut guard).await?;
         let session = guard.as_mut().ok_or("the browser is not open")?;
         let page = &session.page;
         for toggle in toggles {
@@ -1312,6 +1514,7 @@ pub(crate) fn make_browser(
     let profile = profile_override
         .unwrap_or_else(|| home.join("providers").join(&provider.id).join("browser"));
     BrowserChat {
+        parent: None,
         spec: BrowserSpec {
             config: config.clone(),
             provider: provider.clone(),
