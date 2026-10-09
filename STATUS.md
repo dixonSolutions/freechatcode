@@ -858,3 +858,37 @@ wrong password   -> exit 134, ERRCONNECT_LOGON_FAILURE [0x00020014],
   (`freechatcode: opencode started at 0.00s`); with it in place the wrapper writes
   nothing to the pty after the handover, the warm-up line is found in the log file,
   and `ECHO` stays clear across eight samples.
+
+## Authenticated harness demos and argument integrity — 9 October 2026
+
+The current active suite passes 99 tests; 23 live tests remain ignored by default.
+Formatting, Clippy with warnings denied, and the locked build pass. The detailed
+live matrix is in [docs/live-verification.md](docs/live-verification.md).
+
+The replacement main demo uses real OpenCode + DeepSeek to fix whitespace
+normalization and pass four independently checked tests. Additional recordings
+show a successful compact-agent Gemini invoice fix, official OpenClaw invoice
+and whitespace fixes, a successful small OpenCode/Google AI Mode response, and
+an explicitly failed AI Mode coding diagnostic. No failed coding run is presented
+as a passing edit/test demonstration.
+
+Native DSML arguments now use the selected reply's original markdown, avoiding
+rendered indentation and emphasis corruption. Known complete delimiter variants
+are adapted while incomplete parameters remain errors. Malformed JSON tool calls
+produce explicit audited errors instead of silent prose completion. The composer
+is checked before send so provider truncation cannot silently discard context.
+
+Google authentication succeeded in normal native Chromium after automated sign-in
+was rejected. The same profile is attached over loopback CDP. Configure and doctor
+honor CDP; provider-specific endpoints persist without forcing every provider onto
+the same browser. Both Google providers passed subsequent doctor checks without
+repeating the flag. Official OpenClaw now has an isolated config/state adapter;
+the separately installed Cargo package lacks an agent command and is rejected.
+
+Known limitations remain: model prose can end a turn without acting, malformed
+model output is rejected rather than repaired, AI Mode truncates long requests
+at 8,192 characters and can return search fallbacks, and Codewhale supplies no
+automatic per-agent identity. A real OpenCode task created a separate child chat
+and persisted separate identity metadata, but its default child only promised to
+read files; that workflow was not reported as successful. The poll had two votes,
+both for ignoring page reasoning; exclusion remains in place.

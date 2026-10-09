@@ -15,3 +15,6 @@
 /.codewhale/state/
 /.codewhale/pastes/
 /.codewhale/workflow-runs.jsonl
+
+# Python demo tooling bytecode
+__pycache__/

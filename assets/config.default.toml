@@ -55,6 +55,7 @@ routed_url_pattern = "/a/chat/s/"
 [providers.selectors]
 composer = "textarea, [contenteditable='true'][role='textbox'], [contenteditable='true']"
 assistant = ".ds-markdown, [data-message-role='assistant'], [data-role='assistant']"
+assistant_source_property = "markdown"
 # The model's reasoning, when the page renders one above the answer. Excluded
 # from every read of `assistant` — it is the page's own readout, not the model's
 # reply, and on DeepSeek (DeepThink on) it is markdown inside this container, so
