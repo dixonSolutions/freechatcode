@@ -124,7 +124,7 @@ what the wrapper does or does not do to a reply.
 ## Install
 
 ```bash
-cargo install --git https://github.com/dixonSolutions/FreeChatCode
+cargo install --git https://github.com/dixonSolutions/freechatcode
 ```
 
 Not on crates.io yet, so this git install is the one that works today. Or from

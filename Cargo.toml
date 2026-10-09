@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 description = "Run coding agents through free chat web UIs — no API key"
-repository = "https://github.com/dixonSolutions/FreeChatCode"
+repository = "https://github.com/dixonSolutions/freechatcode"
 # So bare `cargo run` launches the bridge rather than asking which binary.
 default-run = "freechatcode"
 
